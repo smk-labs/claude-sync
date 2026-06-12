@@ -42,8 +42,8 @@ function Write-Log {
 }
 
 function Get-AccountDirs {
-    # One UUID folder per account. Newer Claude builds also keep a "_shared"
-    # cross-account store there; it is not an account, leave it alone.
+    # One UUID folder per account. Skip non-account dirs like "_shared"
+    # (left behind by other sync experiments/tools); they are not accounts.
     @(Get-ChildItem -Path $SessionsDir -Directory | Where-Object { $_.Name -notlike '_*' })
 }
 
@@ -160,7 +160,7 @@ function Show-Status {
     $shared = Join-Path $SessionsDir '_shared'
     if (Test-Path $shared) {
         $n = @(Get-ChildItem -Path $shared -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
-        Write-Host ("  _shared (Claude's own cross-account store, untouched): {0} file(s)" -f $n)
+        Write-Host ("  _shared (not an account folder, untouched): {0} file(s)" -f $n)
     }
     if (Test-Path $CanonicalPath) {
         Write-Host "Script: installed at $CanonicalPath"

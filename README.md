@@ -99,14 +99,14 @@ No sudo, no system changes: just a small bash loop (checks every few seconds) pl
 - **Additive only.** Copies files that don't exist at the destination. Never overwrites, never deletes.
 - **Idempotent.** Re-run as often as you like; already-synced files are skipped.
 - **Index only.** Your actual session transcripts in `~/.claude/projects` are never touched.
-- **`_shared` is left alone.** Newer Claude Desktop builds keep a cross-account `_shared` store in the same folder; `claude-sync` skips it.
+- **Only account folders are touched.** Anything else in the sessions dir (for example a `_shared` folder left by other sync tools or experiments) is skipped.
 - **Sentinel-wrapped shell edits.** The command registration lives between `# >>> claude-sync shortcut >>>` markers in your zshrc / PowerShell profile, and uninstall removes exactly that block (with a timestamped backup first).
 
 ---
 
 ## Won't Claude fix this itself?
 
-Probably, eventually. Newer Claude Desktop builds already keep a `_shared` session store, which looks like a move toward account-independent session lists. Until that migration covers existing per-account sessions for everyone, `claude-sync` bridges the gap. The day it's obsolete, removal is one command (see below).
+Maybe someday. As of June 2026, Claude Desktop keeps the local Claude Code session list strictly per account and doesn't merge it when you switch. Until that changes, `claude-sync` bridges the gap. The day it's obsolete, removal is one command (see below).
 
 ---
 

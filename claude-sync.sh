@@ -47,8 +47,8 @@ die() { echo "${YELLOW}$*${RESET}" >&2; exit 1; }
 # Globs only, no find: on macOS, find (getattrlistbulk) can return empty
 # results inside freshly created session dirs while plain readdir works.
 collect_accounts() {
-  # One UUID folder per account. Newer Claude builds also keep a "_shared"
-  # cross-account store there; it is not an account, leave it alone.
+  # One UUID folder per account. Skip non-account dirs like "_shared"
+  # (left behind by other sync experiments/tools); they are not accounts.
   accounts=()
   for d in "$SESSIONS_DIR"/*/; do
     [ -d "$d" ] || continue
@@ -262,7 +262,7 @@ cmd_status() {
     echo "  account $(basename "$d"): $(count_index_files "$d") session index file(s)"
   done
   if [ -d "$SESSIONS_DIR/_shared" ]; then
-    echo "  ${DIM}_shared (Claude's own cross-account store, untouched): $(count_index_files "$SESSIONS_DIR/_shared") file(s)${RESET}"
+    echo "  ${DIM}_shared (not an account folder, untouched): $(count_index_files "$SESSIONS_DIR/_shared") file(s)${RESET}"
   fi
   if [ -f "$CANONICAL_PATH" ]; then
     echo "Script: installed at $CANONICAL_PATH"
