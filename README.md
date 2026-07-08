@@ -2,7 +2,7 @@
 
 **See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-Works on **macOS** and **Windows**. No dependencies, one script per platform. (Profile sync is macOS-only for now; on Windows the script syncs sessions.)
+Works on **macOS** and **Windows**. No dependencies, one script per platform. (Profile sync and delete syncing are macOS-only for now; on Windows the script syncs sessions additively.)
 
 ---
 
@@ -46,13 +46,13 @@ v1 only copied session entries that were *missing* in other accounts. v2 does a 
 - **Much faster.** One single pass over all files instead of comparing every account against every other one.
 - **Safe by default.** Every file a sync changes is backed up first, and `claude-sync --revert` undoes the last sync completely.
 - **Preview first.** `claude-sync --dry-run` prints everything a sync would do, without writing a single file.
-- **v2.1 adds opt-in delete syncing.** Turn it on with `--sync-deletes` when you want deletes to propagate too. See [Syncing deletes (opt-in)](#syncing-deletes-opt-in) below.
+- **v2.1 adds delete syncing.** Deletes can propagate across accounts. See [Syncing deletes](#syncing-deletes) below.
 - **v2.2 adds profile sync.** MCP servers and Desktop Extensions stay in sync across [claude-deck](https://github.com/smk-labs/claude-deck) profiles. See [Profiles](#profiles-claude-deck) below.
+- **v2.3 makes sync real in both directions.** Delete syncing is now the default (any account, any profile, auto-sync included), with `--no-deletes` as the off switch and restore path. MCP server *edits* propagate too: change a server's command in one profile and every profile gets it (the most recently edited config wins).
 
-### Two honest limitations
+### One honest limitation
 
-1. **By default, deleting a session in one account does not delete it elsewhere.** After the next sync, the deleted session comes back (the other accounts still have it). This is deliberate: guessing whether a missing file means "deleted on purpose" is too risky, so sync never deletes anything unless you ask it to. See [Syncing deletes (opt-in)](#syncing-deletes-opt-in) to turn this on.
-2. **Un-archiving does not propagate.** If a session is still archived in *any* account, the next sync archives it everywhere again. To truly unarchive a session, unarchive it in every account (or unarchive it and don't sync).
+**Un-archiving does not propagate.** If a session is still archived in *any* account, the next sync archives it everywhere again. To truly unarchive a session, unarchive it in every account (or unarchive it and don't sync).
 
 ---
 
@@ -60,7 +60,7 @@ v1 only copied session entries that were *missing* in other accounts. v2 does a 
 
 If `~/Library/Application Support/Claude Profiles/` exists (created by a multi-profile launcher such as claude-deck), every sync also reconciles local customization across all data dirs, in the same run and with the same safety rails:
 
-- **MCP servers.** The `mcpServers` block of every `claude_desktop_config.json` becomes the union of all of them: add a server once, it works in every profile. Additive only; nothing is removed; on a name conflict the default profile's definition wins; every other key of each file (preferences, account state) is untouched. JSON handling runs in macOS's built-in `osascript` JavaScript runtime (called by absolute path, so a shadowed binary in `/usr/local/bin` can't interfere): still no dependency.
+- **MCP servers.** The `mcpServers` block of every `claude_desktop_config.json` is fully reconciled. Add a server in one profile: it appears in every profile. Edit a server (change its command, args, env) in one profile: the edit propagates, and if two profiles disagree, the config file edited most recently wins. Remove a server in any profile: the next sync removes it everywhere (run with `--no-deletes` to skip that, or to bring back a server you removed by mistake). A small ledger (`~/.claude/scripts/mcp-ledger.tsv`) remembers which servers were synced everywhere, so "you removed it" is never confused with "a new profile never had it". Every other key of each config file (preferences, account state) is untouched. JSON handling runs in macOS's built-in `osascript` JavaScript runtime (called by absolute path, so a shadowed binary in `/usr/local/bin` can't interfere): still no dependency.
 - **Desktop Extensions.** Extension folders installed in one profile are copied to the profiles that lack them (best effort: some Claude builds may still want one enable-click in the new profile's settings).
 - **Backed up and revertible.** Config overwrites land in the same run manifest as session writes, so `claude-sync --revert` restores them too, and `--dry-run` previews them.
 
@@ -68,22 +68,24 @@ Deliberately **not** synced: logins, cookies, and UI preferences: separate accou
 
 ---
 
-## Syncing deletes (opt-in)
+## Syncing deletes
 
-By default, `claude-sync` never deletes anything. It's off because guessing whether a missing session means "deleted on purpose" or "not synced yet" is risky, and getting it wrong loses a conversation. If that default is too cautious for you, turn on delete syncing yourself.
+Since v2.3, deletes propagate by default: delete a session in any account (or remove an MCP server in any profile) and the next sync deletes it everywhere. This includes auto-sync. It's safe to have on because every deletion is backed up first and three guards watch over it:
 
-Recommended flow: preview first, then run for real.
+- **The ledger.** Only sessions that were once fully synced across every account can be deleted by sync. A session that simply hasn't reached an account yet is copied there, never mistaken for a delete.
+- **The activity guard.** If any surviving copy shows activity newer than the last full sync, the session is kept (the deletion may predate that activity).
+- **Backups.** `claude-sync --revert` brings deleted sessions and MCP servers back, the same way it undoes any other sync.
+
+Two escape hatches:
 
 ```bash
-claude-sync --dry-run --sync-deletes   # preview what would be deleted
-claude-sync --sync-deletes             # actually delete
+claude-sync --dry-run       # preview, including what would be deleted
+claude-sync --no-deletes    # sync WITHOUT deletes; deleted items get
+                            # restored from the accounts that still have
+                            # them (undo a deletion before it propagates)
 ```
 
-**How it decides.** `claude-sync` keeps a ledger that remembers which sessions were fully synced across every account. If a session that used to be in an account is now missing from it, that counts as a delete, unless some other copy of that session shows activity newer than the last full sync. In that case the session was used after the last sync, so it's kept instead (normal resurrection applies), not deleted.
-
-Deletions are backed up first, just like every other change `claude-sync` makes. `claude-sync --revert` brings deleted sessions back, the same way it undoes any other sync.
-
-Auto-sync (the hands-off watcher) never deletes, even if you've turned on `--sync-deletes` for manual runs. Delete propagation only ever happens when you run it yourself.
+`--sync-deletes` from v2.1/v2.2 is still accepted and does nothing: it's the default now.
 
 ---
 
@@ -114,10 +116,10 @@ You log into a second account in Claude Desktop and your Claude Code session lis
 
 | macOS | Windows | What it does |
 |---|---|---|
-| `claude-sync` | `claude-sync` | Run the sync. Idempotent, safe to re-run anytime. |
-| `claude-sync --dry-run` | `claude-sync -DryRun` | Show everything a sync would create or overwrite. Writes nothing, not even backups. |
-| `claude-sync --sync-deletes` | `claude-sync -SyncDeletes` | Also propagate deletes (see [Syncing deletes (opt-in)](#syncing-deletes-opt-in)). Can combine with `--dry-run` / `-DryRun` to preview deletes first. |
-| `claude-sync --revert` | `claude-sync -Revert` | Undo the last sync: delete the files it created, restore the files it overwrote (including sessions deleted by `--sync-deletes`). Run again to undo the sync before that. |
+| `claude-sync` | `claude-sync` | Run the sync (deletes propagate by default; see [Syncing deletes](#syncing-deletes)). Idempotent, safe to re-run anytime. |
+| `claude-sync --dry-run` | `claude-sync -DryRun` | Show everything a sync would create, overwrite, or delete. Writes nothing, not even backups. |
+| `claude-sync --no-deletes` | (macOS only) | Sync without propagating deletes; restores anything deleted on one side from the surviving copies (see [Syncing deletes](#syncing-deletes)). |
+| `claude-sync --revert` | `claude-sync -Revert` | Undo the last sync: delete the files it created, restore the files it overwrote or deleted. Run again to undo the sync before that. |
 | `claude-sync --status` | `claude-sync -Status` | Show detected accounts, per-account session counts, install state, last sync time, stored backup runs. |
 | `claude-sync --install` | `claude-sync -Install` | Copy the script to `~/.claude/scripts/` and register the `claude-sync` command (zshrc alias / PowerShell profile function). Re-run to update. |
 | `claude-sync --uninstall` | `claude-sync -Uninstall` | Remove the registered command (and the auto-sync watcher). |
@@ -155,7 +157,7 @@ The desktop app picks up the changes on next launch. The transcripts the index p
 
 - **Backups before every write.** Each sync that changes anything stores the old files under `~/.claude/scripts/backups/`, with a manifest of exactly what was created and what was overwritten. The 10 most recent runs are kept.
 - **One-command undo.** `claude-sync --revert` replays the newest manifest in reverse. Run it again to step back one more sync.
-- **Never deletes by default.** Sync only creates and updates index files unless you opt in with `--sync-deletes` (see [Syncing deletes (opt-in)](#syncing-deletes-opt-in)).
+- **Deletes are guarded.** Deletion propagation only touches sessions the ledger saw fully synced everywhere, skips anything with newer activity, backs everything up first, and can be turned off per run with `--no-deletes` (see [Syncing deletes](#syncing-deletes)).
 - **Preview mode.** `claude-sync --dry-run` prints every planned action and the summary, and writes nothing.
 - **Index only.** Your actual session transcripts in `~/.claude/projects` are never touched.
 - **Only account folders are touched.** Anything else in the sessions dir (for example a `_shared` folder left by other sync tools or experiments) is skipped and never written into.
@@ -196,7 +198,10 @@ The other account has never created a Claude Code session on this machine, so it
 Quit Claude Desktop fully (not just the window) and reopen. The app reads the index at launch.
 
 **A session I deleted came back.**
-Expected by default. Sync only deletes elsewhere if you ran it with `--sync-deletes` (see [Syncing deletes (opt-in)](#syncing-deletes-opt-in)). Otherwise, the copies in your other accounts restore it (limitation 1 above).
+Two possibilities. Either it was never fully synced everywhere (the ledger won't allow deleting those, so other accounts restore it: sync once, then delete it again), or some copy of it had activity newer than the last sync (the activity guard kept it; the log says so). Delete it again and the next sync will propagate the delete.
+
+**I deleted something by mistake and it's gone everywhere.**
+`claude-sync --revert` undoes the whole last run, deletions included. If the deletion hasn't synced yet, run `claude-sync --no-deletes` instead: the surviving copies get copied back.
 
 **A session I unarchived got archived again.**
 Expected. It's still archived in another account, and archived wins (limitation 2 above). Unarchive it in every account.
