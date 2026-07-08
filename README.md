@@ -1,8 +1,8 @@
 # claude-sync
 
-**See all your Claude Code sessions, no matter which Claude account you're logged into.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. `claude-sync` keeps those indexes in sync across accounts: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
+**See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-Works on **macOS** and **Windows**. No dependencies, one script per platform.
+Works on **macOS** and **Windows**. No dependencies, one script per platform. (Profile sync is macOS-only for now; on Windows the script syncs sessions.)
 
 ---
 
@@ -47,11 +47,24 @@ v1 only copied session entries that were *missing* in other accounts. v2 does a 
 - **Safe by default.** Every file a sync changes is backed up first, and `claude-sync --revert` undoes the last sync completely.
 - **Preview first.** `claude-sync --dry-run` prints everything a sync would do, without writing a single file.
 - **v2.1 adds opt-in delete syncing.** Turn it on with `--sync-deletes` when you want deletes to propagate too. See [Syncing deletes (opt-in)](#syncing-deletes-opt-in) below.
+- **v2.2 adds profile sync.** MCP servers and Desktop Extensions stay in sync across [claude-deck](https://github.com/smk-labs/claude-deck) profiles. See [Profiles](#profiles-claude-deck) below.
 
 ### Two honest limitations
 
 1. **By default, deleting a session in one account does not delete it elsewhere.** After the next sync, the deleted session comes back (the other accounts still have it). This is deliberate: guessing whether a missing file means "deleted on purpose" is too risky, so sync never deletes anything unless you ask it to. See [Syncing deletes (opt-in)](#syncing-deletes-opt-in) to turn this on.
 2. **Un-archiving does not propagate.** If a session is still archived in *any* account, the next sync archives it everywhere again. To truly unarchive a session, unarchive it in every account (or unarchive it and don't sync).
+
+---
+
+## Profiles (claude-deck)
+
+If `~/Library/Application Support/Claude Profiles/` exists (created by a multi-profile launcher such as claude-deck), every sync also reconciles local customization across all data dirs, in the same run and with the same safety rails:
+
+- **MCP servers.** The `mcpServers` block of every `claude_desktop_config.json` becomes the union of all of them: add a server once, it works in every profile. Additive only; nothing is removed; on a name conflict the default profile's definition wins; every other key of each file (preferences, account state) is untouched. JSON handling runs in macOS's built-in `osascript` JavaScript runtime (called by absolute path, so a shadowed binary in `/usr/local/bin` can't interfere): still no dependency.
+- **Desktop Extensions.** Extension folders installed in one profile are copied to the profiles that lack them (best effort: some Claude builds may still want one enable-click in the new profile's settings).
+- **Backed up and revertible.** Config overwrites land in the same run manifest as session writes, so `claude-sync --revert` restores them too, and `--dry-run` previews them.
+
+Deliberately **not** synced: logins, cookies, and UI preferences: separate accounts are the whole point of profiles. Claude Code customization (plugins, skills, hooks, memory in `~/.claude`) is already machine-global and needs no syncing. Per-profile session dirs are claude-deck's job (it symlinks them to the shared one).
 
 ---
 

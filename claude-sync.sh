@@ -15,15 +15,37 @@
 #     back.) Opt-in deletion propagation is available with --sync-deletes;
 #     see the ledger machinery below.
 #
-# Compatible with the stock macOS /bin/bash (3.2). No dependencies.
+# It also syncs customization across PROFILES: multi-profile launchers
+# (claude-deck) give each profile its own data dir under
+# ~/Library/Application Support/Claude Profiles/<name>/, so local MCP
+# servers (the mcpServers block of claude_desktop_config.json) and installed
+# Desktop Extensions diverge per profile. Every sync unions mcpServers
+# across all data dirs (additive; the default profile wins a name conflict;
+# every other key is untouched) and copies missing extensions. Config writes
+# are backed up into the run's manifest, so --revert undoes them too.
+# Logins, cookies, and UI preferences are deliberately never synced:
+# separate accounts are the whole point of profiles. Claude Code
+# customization (plugins, skills, hooks, memory in ~/.claude) is already
+# machine-global and needs no syncing. Session dirs inside profiles are
+# claude-deck's job (it symlinks them to the shared one), not ours.
+#
+# Compatible with the stock macOS /bin/bash (3.2). No dependencies
+# (JSON merging runs in macOS's built-in osascript JavaScript runtime).
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
-# CLAUDE_SYNC_SESSIONS_DIR / CLAUDE_SYNC_HOME exist so tests can point the
-# script at a throwaway tree instead of the real one.
+# Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
+# the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
+OSASCRIPT="/usr/bin/osascript"
+
+# CLAUDE_SYNC_SESSIONS_DIR / CLAUDE_SYNC_HOME (and the two profile-root
+# overrides) exist so tests can point the script at a throwaway tree
+# instead of the real one.
 SESSIONS_DIR="${CLAUDE_SYNC_SESSIONS_DIR:-$HOME/Library/Application Support/Claude/claude-code-sessions}"
+DEFAULT_ROOT="${CLAUDE_SYNC_DEFAULT_ROOT:-$HOME/Library/Application Support/Claude}"
+PROFILES_DIR="${CLAUDE_SYNC_PROFILES_DIR:-$HOME/Library/Application Support/Claude Profiles}"
 CANONICAL_DIR="${CLAUDE_SYNC_HOME:-$HOME/.claude/scripts}"
 CANONICAL_PATH="$CANONICAL_DIR/claude-sync.sh"
 LOG="$CANONICAL_DIR/claude-sync.log"
@@ -88,6 +110,201 @@ count_index_files() {
     done
   done
   echo "$n"
+}
+
+# ---------- profile customization sync ------------------------------------
+collect_roots() {
+  # Every Claude data dir on this machine: the default one, plus one per
+  # profile when a multi-profile launcher (claude-deck) is in use. The
+  # default root comes first so its definitions win union conflicts.
+  roots=("$DEFAULT_ROOT")
+  for d in "$PROFILES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    roots+=("${d%/}")
+  done
+}
+
+ensure_run_dir() {
+  # Backups for THIS run live in one dir with one manifest, shared by the
+  # session plan executor and the profile config sync, so --revert undoes
+  # a whole run no matter which layer wrote. Created lazily on first write.
+  [ -n "${RUN_DIR:-}" ] && return 0
+  RUN_DIR="$BACKUPS_DIR/$(date +%s)"
+  MANIFEST="$RUN_DIR/manifest.tsv"
+  mkdir -p "$RUN_DIR"
+  : > "$MANIFEST"
+}
+
+sync_mcp_servers() {
+  # Union the mcpServers block of claude_desktop_config.json across every
+  # root, additively: a server missing from a root is added; nothing is
+  # ever removed or overwritten (the default root is passed first, so its
+  # definition wins a name conflict), and every other key of each file is
+  # preserved. $1 = "dry" prints the plan and writes nothing. Real writes
+  # back the previous file into the run manifest as an overwrite, so
+  # --revert restores it. JSON runs in osascript's JS runtime: no deps.
+  mode="$1"
+  [ ${#roots[@]} -lt 2 ] && return 0
+
+  cfg_files=()
+  for root in "${roots[@]}"; do
+    cfg="$root/claude_desktop_config.json"
+    if [ ! -f "$cfg" ]; then
+      [ "$mode" = "dry" ] && continue
+      printf '{}\n' > "$cfg" 2>/dev/null || continue
+    fi
+    cfg_files+=("$cfg")
+  done
+  [ ${#cfg_files[@]} -lt 2 ] && return 0
+
+  plan_out=$("$OSASCRIPT" -l JavaScript - "${cfg_files[@]}" 2>&1 <<'JXA'
+function run(argv) {
+  ObjC.import('Foundation');
+  function read(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
+    return s.isNil() ? null : ObjC.unwrap(s);
+  }
+  var union = {}, order = [], out = [];
+  for (var i = 0; i < argv.length; i++) {
+    var t = read(argv[i]), j;
+    try { j = t ? JSON.parse(t) : {}; }
+    catch (e) { return 'ERR not valid JSON, profile sync skipped: ' + argv[i]; }
+    var m = j.mcpServers || {};
+    for (var k in m) { if (!(k in union)) { union[k] = m[k]; order.push(k); } }
+  }
+  if (order.length === 0) return '';
+  for (var i = 0; i < argv.length; i++) {
+    var t = read(argv[i]), j = t ? JSON.parse(t) : {};
+    var m = j.mcpServers || {}, added = [];
+    for (var q = 0; q < order.length; q++) {
+      if (!(order[q] in m)) added.push(order[q]);
+    }
+    if (added.length) out.push(argv[i] + '\t' + added.join(','));
+  }
+  return out.join('\n');
+}
+JXA
+  )
+
+  case "$plan_out" in
+    ERR*) log "MCP servers: ${plan_out#ERR }"; return 0 ;;
+    "")   return 0 ;;
+  esac
+
+  # Plan is known: in dry mode just narrate it; otherwise back up every
+  # file the write pass will touch, into this run's backup dir.
+  while IFS=$'\t' read -r cfg added; do
+    [ -n "$cfg" ] || continue
+    if [ "$mode" = "dry" ]; then
+      echo "  ${DIM}would add MCP server(s)${RESET} [$added] -> $cfg"
+      continue
+    fi
+    ensure_run_dir
+    mkdir -p "$RUN_DIR/configs"
+    cp -p "$cfg" "$RUN_DIR/configs/$(echo "$cfg" | tr '/' '_')"
+  done <<EOF_PLAN
+$plan_out
+EOF_PLAN
+
+  if [ "$mode" = "dry" ]; then
+    return 0
+  fi
+
+  merge_out=$("$OSASCRIPT" -l JavaScript - "${cfg_files[@]}" 2>&1 <<'JXA3'
+function run(argv) {
+  ObjC.import('Foundation');
+  function read(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
+    return s.isNil() ? null : ObjC.unwrap(s);
+  }
+  function write(p, s) {
+    $(s).writeToFileAtomicallyEncodingError($(p), true, $.NSUTF8StringEncoding, $());
+  }
+  var cfgs = [], union = {}, order = [], out = [];
+  for (var i = 0; i < argv.length; i++) {
+    var t = read(argv[i]), j;
+    try { j = t ? JSON.parse(t) : {}; }
+    catch (e) { return 'ERR not valid JSON, profile sync skipped: ' + argv[i]; }
+    cfgs.push(j);
+    var m = j.mcpServers || {};
+    for (var k in m) { if (!(k in union)) { union[k] = m[k]; order.push(k); } }
+  }
+  for (var i = 0; i < argv.length; i++) {
+    var j = cfgs[i], m = j.mcpServers || {}, added = [];
+    for (var q = 0; q < order.length; q++) {
+      var k = order[q];
+      if (!(k in m)) { m[k] = union[k]; added.push(k); }
+    }
+    if (added.length) {
+      j.mcpServers = m;
+      write(argv[i], JSON.stringify(j, null, 2) + '\n');
+      out.push('+' + added.length + ' MCP server(s) [' + added.join(', ') + '] -> ' + argv[i]);
+    }
+  }
+  return out.join('\n');
+}
+JXA3
+  )
+  case "$merge_out" in
+    ERR*) log "MCP servers: ${merge_out#ERR }"; return 0 ;;
+  esac
+  if [ -n "$merge_out" ]; then
+    while IFS= read -r line; do
+      log "  $line"
+      cfg_path="${line##*-> }"
+      printf 'overwrote\t%s\t%s\n' "$cfg_path" "$RUN_DIR/configs/$(echo "$cfg_path" | tr '/' '_')" >> "$MANIFEST"
+    done <<EOF_OUT
+$merge_out
+EOF_OUT
+  fi
+}
+
+sync_extensions() {
+  # Copy installed Desktop Extensions across roots, additively. Best
+  # effort: a Claude build that also tracks extensions in per-profile
+  # preferences may still want one enable-click in that profile.
+  mode="$1"
+  [ ${#roots[@]} -lt 2 ] && return 0
+  copied=0
+  for src_root in "${roots[@]}"; do
+    src_ext="$src_root/Claude Extensions"
+    [ -d "$src_ext" ] || continue
+    for ext in "$src_ext"/*/; do
+      [ -d "$ext" ] || continue
+      name=$(basename "$ext")
+      for dst_root in "${roots[@]}"; do
+        [ "$src_root" = "$dst_root" ] && continue
+        dst="$dst_root/Claude Extensions/$name"
+        if [ ! -e "$dst" ]; then
+          if [ "$mode" = "dry" ]; then
+            echo "  ${DIM}would copy extension${RESET} $name -> $(basename "$dst_root")"
+            copied=$((copied + 1))
+            continue
+          fi
+          mkdir -p "$dst_root/Claude Extensions"
+          if cp -R "${ext%/}" "$dst"; then
+            ensure_run_dir
+            printf 'created\t%s\n' "$dst" >> "$MANIFEST"
+            copied=$((copied + 1))
+          fi
+        fi
+      done
+    done
+  done
+  if [ "$copied" -gt 0 ] && [ "$mode" != "dry" ]; then
+    log "Extensions: $copied copied across profiles."
+  fi
+  return 0
+}
+
+sync_profiles() {
+  # Orchestrates the profile layer. Fast, runs before the session machinery,
+  # and independent of it (profiles exist even with a single account).
+  mode="$1"
+  collect_roots
+  [ ${#roots[@]} -lt 2 ] && return 0
+  sync_mcp_servers "$mode"
+  sync_extensions "$mode"
 }
 
 # ---------- sync core ------------------------------------------------------
@@ -482,11 +699,9 @@ execute_plan() {
   # Every write is recorded in the run's manifest; overwrites are backed up
   # first (mirroring <account>/<org>/ so --revert can put them back).
   # cp -p everywhere: plain cp resets mtime, which would make copies look
-  # newer than they are on later inspection.
-  RUN_DIR="$BACKUPS_DIR/$(date +%s)"
-  MANIFEST="$RUN_DIR/manifest.tsv"
-  mkdir -p "$RUN_DIR"
-  : > "$MANIFEST"
+  # newer than they are on later inspection. The run dir may already exist
+  # if the profile layer wrote first; both layers share one manifest.
+  ensure_run_dir
 
   while IFS=$'\t' read -r verb flags fname src dst acct org; do
     if [ "$verb" = "create" ] && [ ! -f "$dst" ]; then
@@ -547,6 +762,10 @@ sync_run() {
   # behavior (including output) is byte-identical to v2.0.0.
   mode="${1:-}"
   sync_deletes="${2:-}"
+
+  # Profile customization first: fast, and independent of the session
+  # machinery (profiles exist even with a single account or no sessions).
+  sync_profiles "$mode"
 
   if [ ! -d "$SESSIONS_DIR" ]; then
     log "Sessions folder not found: $SESSIONS_DIR"
@@ -794,6 +1013,18 @@ cmd_uninstall() {
 # ---------- status / help -------------------------------------------------
 cmd_status() {
   echo "claude-sync v$VERSION"
+  collect_roots
+  if [ ${#roots[@]} -gt 1 ]; then
+    echo "Data dirs: ${#roots[@]} (default + $(( ${#roots[@]} - 1 )) profile(s) in 'Claude Profiles')"
+    for root in "${roots[@]}"; do
+      cfg="$root/claude_desktop_config.json"
+      n=0
+      if [ -f "$cfg" ]; then
+        n=$("$OSASCRIPT" -l JavaScript -e 'function run(a){ObjC.import("Foundation");var s=$.NSString.stringWithContentsOfFileEncodingError($(a[0]),$.NSUTF8StringEncoding,$());if(s.isNil())return 0;try{return Object.keys(JSON.parse(ObjC.unwrap(s)).mcpServers||{}).length}catch(e){return "?"}}' "$cfg" 2>/dev/null)
+      fi
+      echo "  $(basename "$root"): $n MCP server(s)"
+    done
+  fi
   echo "Sessions dir: $SESSIONS_DIR"
   if [ ! -d "$SESSIONS_DIR" ]; then
     echo "  ${YELLOW}(not found: open Claude Code in Claude Desktop once)${RESET}"
@@ -836,10 +1067,14 @@ cmd_status() {
 usage() {
   cat <<EOF
 claude-sync v$VERSION
-Make local Claude Code sessions visible across all Claude Desktop accounts.
-Newest session state wins; archived-in-one means archived-everywhere;
-overwrites are backed up and revertible. By default nothing is ever
-deleted, so a session deleted in one account comes back on the next sync.
+Make local Claude Code sessions visible across all Claude Desktop accounts,
+and keep customization (MCP servers, Desktop Extensions) in sync across
+profiles (claude-deck). Newest session state wins; archived-in-one means
+archived-everywhere; overwrites are backed up and revertible. By default
+nothing is ever deleted, so a session deleted in one account comes back on
+the next sync. Profile sync is additive only: the mcpServers union is added
+to every profile's claude_desktop_config.json, default profile wins name
+conflicts, logins/cookies/preferences are never touched.
 
 Usage: claude-sync [command]
 
