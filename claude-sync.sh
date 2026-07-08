@@ -10,7 +10,7 @@
 #   - the copy with the newest lastActivityAt wins,
 #   - archived-in-one means archived-everywhere,
 #   - every overwrite is backed up first and can be undone with --revert,
-#   - deletions propagate by default (v2.3): a session fully synced once,
+#   - deletions propagate by default: a session fully synced once,
 #     then deleted in ANY account and untouched since, is deleted everywhere
 #     (backed up first, revertible). --no-deletes turns that off for a run;
 #     because a skipped deletion is re-copied from the surviving accounts,
@@ -42,7 +42,7 @@
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="2.3.0"
+VERSION="3.0.0"
 
 # Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
 # the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
@@ -377,10 +377,9 @@ sync_profiles() {
 }
 
 # ---------- sync core ------------------------------------------------------
-# Two passes over the whole tree, O(total files). v1 looped
-# src-account x dst-account x dst-org x file (~70k existence checks plus a
-# basename subshell each); v2 reads every file exactly once and plans all
-# copies from that inventory.
+# Two passes over the whole tree, O(total files): every index file is read
+# exactly once and all copies are planned from that inventory (never
+# src-account x dst-account loops; that was ~70k existence checks here).
 #
 # All intermediate state lives in $WORK_DIR (a mktemp dir, removed on exit):
 #   orgdirs.tsv   account<TAB>org<TAB>orgPath      (every destination dir)
@@ -636,7 +635,7 @@ compute_deletions() {
 
 update_ledger() {
   # Called at the end of EVERY successful non-dry sync, flag or not (the
-  # ledger is what makes a future --sync-deletes run able to tell "deleted"
+  # ledger is what makes a future deletion pass able to tell "deleted"
   # apart from "never synced here yet"). Records fname + winner ts for every
   # session present, after this run's writes, in every account. Reads the
   # post-execute state from disk rather than trusting the pre-run inventory,
@@ -702,7 +701,7 @@ update_ledger() {
   mv "$ledger_tmp" "$LEDGER"
 
   # Record which accounts this ledger considers "everywhere", so a future
-  # --sync-deletes run can tell a brand-new account (not part of this set)
+  # deletion pass can tell a brand-new account (not part of this set)
   # apart from an account that genuinely had a ledgered session removed.
   accts_tmp="$CANONICAL_DIR/.ledger-accounts.tmp.$$"
   cp "$WORK_DIR/accounts.tsv" "$accts_tmp"
@@ -710,11 +709,9 @@ update_ledger() {
 }
 
 plan_summary() {
-  # Honest counts: unique sessions, never file copies (v1 reported one
-  # session copied to 12 destinations as "12 synced"). $1 is the emit
+  # Honest counts: unique sessions, never file copies. $1 is the emit
   # command (log for real runs, echo for dry runs). Delete rows (verb
-  # "delete") never exist under --no-deletes; when the plan has none,
-  # every line below is byte-identical to v2.0.0 output.
+  # "delete") never exist under --no-deletes.
   emit="$1"
   total_sessions=$(awk 'END { print NR }' "$WORK_DIR/winners.tsv")
 
@@ -1156,7 +1153,6 @@ Usage: claude-sync [command]
                      one side but alive elsewhere is copied back instead:
                      use this to restore a session or MCP server you
                      deleted by mistake (before the deletion has synced).
-  --sync-deletes     Legacy no-op: deletion propagation is now the default.
   --revert           Undo the most recent sync run from its backup.
   --status           Show detected accounts, session counts, install state.
   --install          Copy this script to ~/.claude/scripts/ and register the
@@ -1179,17 +1175,15 @@ EOF
 
 # ---------- dispatcher ----------------------------------------------------
 # --dry-run and --no-deletes combine in any order; every other command
-# stays a single, exact argument. --sync-deletes is accepted as a legacy
-# no-op (deletion propagation is the default since v2.3).
+# stays a single, exact argument.
 case "${1:-}" in
-  ""|--dry-run|--sync-deletes|--no-deletes)
+  ""|--dry-run|--no-deletes)
     dry=""; deletes="deletes"
     for arg in "$@"; do
       case "$arg" in
-        --dry-run)      dry="dry" ;;
-        --sync-deletes) ;;
-        --no-deletes)   deletes="nodeletes" ;;
-        *)              usage; exit 1 ;;
+        --dry-run)    dry="dry" ;;
+        --no-deletes) deletes="nodeletes" ;;
+        *)            usage; exit 1 ;;
       esac
     done
     do_sync "$dry" "$deletes"

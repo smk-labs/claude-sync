@@ -2,7 +2,7 @@
 
 **See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-Works on **macOS** and **Windows**. No dependencies, one script per platform. (Profile sync and delete syncing are macOS-only for now; on Windows the script syncs sessions additively.)
+**macOS**, one script, no dependencies. (A Windows script existed up to v2 but only did v1-level additive session sync; it was removed rather than left to mislead. It lives in git history if anyone needs a starting point.)
 
 ---
 
@@ -14,16 +14,8 @@ Works on **macOS** and **Windows**. No dependencies, one script per platform. (P
 
 Same one-liner does both, fresh install or pulling the latest version. From then on, the `claude-sync` command works in every new terminal.
 
-**macOS:**
-
 ```bash
 curl -fsSLo /tmp/cs.sh https://raw.githubusercontent.com/smk-labs/claude-sync/main/claude-sync.sh && chmod +x /tmp/cs.sh && /tmp/cs.sh --install && source ~/.zshrc
-```
-
-**Windows (PowerShell):**
-
-```powershell
-iwr -useb https://raw.githubusercontent.com/smk-labs/claude-sync/main/claude-sync.ps1 -OutFile "$env:TEMP\claude-sync.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\claude-sync.ps1" -Install; . $PROFILE
 ```
 
 Then:
@@ -36,19 +28,17 @@ That's it.
 
 ---
 
-## What's new in v2
+## What it does
 
-v1 only copied session entries that were *missing* in other accounts. v2 does a real sync:
+A full two-way sync, not a one-way copy:
 
 - **Sessions update everywhere, not just appear.** Continue or rename a session in one account and every other account gets the newer version. Newest activity wins.
 - **Archiving propagates.** Archive a session in one account and the next sync archives it in all accounts.
+- **Deletes propagate.** Delete a session in any account and the next sync deletes it everywhere, guarded and backed up. `--no-deletes` turns that off per run and doubles as the restore path. See [Syncing deletes](#syncing-deletes).
+- **Profiles stay identical.** MCP servers (adds, edits, removals) and Desktop Extensions sync across [claude-deck](https://github.com/smk-labs/claude-deck) profiles. On an edit conflict, the most recently edited config wins. See [Profiles](#profiles-claude-deck).
+- **Safe by default.** Every file a sync changes is backed up first, `claude-sync --revert` undoes the last run completely, and `claude-sync --dry-run` previews everything without writing a byte.
 - **Honest summary numbers.** The report counts sessions, not file copies. "3 new, 5 updated" means 3 sessions and 5 sessions, not the 36 files behind them.
-- **Much faster.** One single pass over all files instead of comparing every account against every other one.
-- **Safe by default.** Every file a sync changes is backed up first, and `claude-sync --revert` undoes the last sync completely.
-- **Preview first.** `claude-sync --dry-run` prints everything a sync would do, without writing a single file.
-- **v2.1 adds delete syncing.** Deletes can propagate across accounts. See [Syncing deletes](#syncing-deletes) below.
-- **v2.2 adds profile sync.** MCP servers and Desktop Extensions stay in sync across [claude-deck](https://github.com/smk-labs/claude-deck) profiles. See [Profiles](#profiles-claude-deck) below.
-- **v2.3 makes sync real in both directions.** Delete syncing is now the default (any account, any profile, auto-sync included), with `--no-deletes` as the off switch and restore path. MCP server *edits* propagate too: change a server's command in one profile and every profile gets it (the most recently edited config wins).
+- **Fast.** One single pass over all files instead of comparing every account against every other one.
 
 ### One honest limitation
 
@@ -85,7 +75,6 @@ claude-sync --no-deletes    # sync WITHOUT deletes; deleted items get
                             # them (undo a deletion before it propagates)
 ```
 
-`--sync-deletes` from v2.1/v2.2 is still accepted and does nothing: it's the default now.
 
 ---
 
@@ -94,7 +83,7 @@ claude-sync --no-deletes    # sync WITHOUT deletes; deleted items get
 You log into a second account in Claude Desktop and your Claude Code session list is suddenly empty. Your sessions are not gone:
 
 - **Transcripts** live in `~/.claude/projects` and are shared by every account.
-- **The session index** (what the desktop app's session list shows) is per account: `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/local_*.json` on macOS, `%APPDATA%\Claude\claude-code-sessions\...` on Windows.
+- **The session index** (what the desktop app's session list shows) is per account: `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/local_*.json`.
 
 `claude-sync` merges those per-account indexes. After a restart of Claude, every account sees the same full, up-to-date list.
 
@@ -114,19 +103,19 @@ You log into a second account in Claude Desktop and your Claude Code session lis
 
 ## Commands
 
-| macOS | Windows | What it does |
-|---|---|---|
-| `claude-sync` | `claude-sync` | Run the sync (deletes propagate by default; see [Syncing deletes](#syncing-deletes)). Idempotent, safe to re-run anytime. |
-| `claude-sync --dry-run` | `claude-sync -DryRun` | Show everything a sync would create, overwrite, or delete. Writes nothing, not even backups. |
-| `claude-sync --no-deletes` | (macOS only) | Sync without propagating deletes; restores anything deleted on one side from the surviving copies (see [Syncing deletes](#syncing-deletes)). |
-| `claude-sync --revert` | `claude-sync -Revert` | Undo the last sync: delete the files it created, restore the files it overwrote or deleted. Run again to undo the sync before that. |
-| `claude-sync --status` | `claude-sync -Status` | Show detected accounts, per-account session counts, install state, last sync time, stored backup runs. |
-| `claude-sync --install` | `claude-sync -Install` | Copy the script to `~/.claude/scripts/` and register the `claude-sync` command (zshrc alias / PowerShell profile function). Re-run to update. |
-| `claude-sync --uninstall` | `claude-sync -Uninstall` | Remove the registered command (and the auto-sync watcher). |
-| `claude-sync --auto-install` | `claude-sync -AutoInstall` | Hands-off mode: auto-sync every time Claude Desktop quits. |
-| `claude-sync --auto-uninstall` | `claude-sync -AutoUninstall` | Disable hands-off mode. |
-| `claude-sync --version` | `claude-sync -Version` | Print the version. |
-| `claude-sync --help` | `claude-sync -Help` | Print usage. |
+| Command | What it does |
+|---|---|
+| `claude-sync` | Run the sync (deletes propagate by default; see [Syncing deletes](#syncing-deletes)). Idempotent, safe to re-run anytime. |
+| `claude-sync --dry-run` | Show everything a sync would create, overwrite, or delete. Writes nothing, not even backups. |
+| `claude-sync --no-deletes` | Sync without propagating deletes; restores anything deleted on one side from the surviving copies (see [Syncing deletes](#syncing-deletes)). |
+| `claude-sync --revert` | Undo the last sync: delete the files it created, restore the files it overwrote or deleted. Run again to undo the sync before that. |
+| `claude-sync --status` | Show detected accounts and profiles, session and MCP server counts, install state, last sync time, stored backup runs. |
+| `claude-sync --install` | Copy the script to `~/.claude/scripts/` and register the `claude-sync` alias in `~/.zshrc`. Re-run to update. |
+| `claude-sync --uninstall` | Remove the alias (and the auto-sync watcher). |
+| `claude-sync --auto-install` | Hands-off mode: auto-sync every time Claude Desktop quits. |
+| `claude-sync --auto-uninstall` | Disable hands-off mode. |
+| `claude-sync --version` | Print the version. |
+| `claude-sync --help` | Print usage. |
 
 ---
 
@@ -139,7 +128,7 @@ claude-sync --auto-install      # enable
 claude-sync --auto-uninstall    # disable
 ```
 
-On macOS this is a LaunchAgent (a small bash loop that checks every few seconds, plus a plist in `~/Library/LaunchAgents/`), on Windows a Scheduled Task. No sudo, no admin rights, no system changes. Log at `~/.claude/scripts/claude-sync.log`.
+This is a LaunchAgent (a small bash loop that checks every few seconds, plus a plist in `~/Library/LaunchAgents/`). No sudo, no admin rights, no system changes. Log at `~/.claude/scripts/claude-sync.log`. The watcher syncs with the default settings, deletes included.
 
 ---
 
@@ -161,7 +150,7 @@ The desktop app picks up the changes on next launch. The transcripts the index p
 - **Preview mode.** `claude-sync --dry-run` prints every planned action and the summary, and writes nothing.
 - **Index only.** Your actual session transcripts in `~/.claude/projects` are never touched.
 - **Only account folders are touched.** Anything else in the sessions dir (for example a `_shared` folder left by other sync tools or experiments) is skipped and never written into.
-- **Sentinel-wrapped shell edits.** The command registration lives between `# >>> claude-sync shortcut >>>` markers in your zshrc / PowerShell profile, and uninstall removes exactly that block (with a timestamped backup first).
+- **Sentinel-wrapped shell edits.** The command registration lives between `# >>> claude-sync shortcut >>>` markers in your zshrc, and uninstall removes exactly that block (with a timestamped backup first).
 
 ---
 
@@ -173,18 +162,9 @@ Maybe someday. As of mid 2026, Claude Desktop keeps the local Claude Code sessio
 
 ## Uninstall fully
 
-**macOS:**
-
 ```bash
 claude-sync --uninstall        # removes the alias and the auto-sync agent
 rm -rf ~/.claude/scripts/claude-sync.sh ~/.claude/scripts/claude-sync.log ~/.claude/scripts/backups
-```
-
-**Windows:**
-
-```powershell
-claude-sync -Uninstall
-Remove-Item -Recurse "$HOME\.claude\scripts\claude-sync.ps1", "$HOME\.claude\scripts\claude-sync.log", "$HOME\.claude\scripts\backups"
 ```
 
 ---
@@ -208,9 +188,6 @@ Expected. It's still archived in another account, and archived wins (limitation 
 
 **A sync did something you didn't want.**
 Run `claude-sync --revert`. Next time, preview with `claude-sync --dry-run` first.
-
-**Windows: `claude-sync` is not recognized.**
-Open a new terminal, or run `. $PROFILE`. If you use both Windows PowerShell and PowerShell 7, run the installer once in each (they have separate profiles).
 
 **A session opens but looks unrelated / belongs to another org.**
 Session indexes are synced across all account and org folders on the machine. If you keep strictly separated work and personal data, sync manually only when you need it (skip hands-off mode).
