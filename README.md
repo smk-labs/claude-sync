@@ -2,7 +2,7 @@
 
 **See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-**macOS**, one script, no dependencies. (A Windows script existed up to v2 but only did v1-level additive session sync; it was removed rather than left to mislead. It lives in git history if anyone needs a starting point.)
+**macOS** (`claude-sync.sh`) and **Windows** (`claude-sync.ps1`), one script per platform, no dependencies. Both implement the same v3 behavior; the Windows script works on Windows PowerShell 5.1 and PowerShell 7+ and accepts both `-DryRun`-style switches and the macOS `--dry-run` spellings.
 
 ---
 
@@ -14,11 +14,19 @@
 
 Same one-liner does both, fresh install or pulling the latest version. From then on, the `claude-sync` command works in every new terminal.
 
+macOS:
+
 ```bash
 curl -fsSLo /tmp/cs.sh https://raw.githubusercontent.com/smk-labs/claude-sync/main/claude-sync.sh && chmod +x /tmp/cs.sh && /tmp/cs.sh --install && source ~/.zshrc
 ```
 
-Then:
+Windows (PowerShell):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/smk-labs/claude-sync/main/claude-sync.ps1 -OutFile "$env:TEMP\cs.ps1"; & "$env:TEMP\cs.ps1" -Install
+```
+
+Then, in a new terminal:
 
 ```bash
 claude-sync
@@ -48,9 +56,9 @@ A full two-way sync, not a one-way copy:
 
 ## Profiles (claude-deck)
 
-If `~/Library/Application Support/Claude Profiles/` exists (created by a multi-profile launcher such as claude-deck), every sync also reconciles local customization across all data dirs, in the same run and with the same safety rails:
+If `~/Library/Application Support/Claude Profiles/` exists (Windows: `%APPDATA%\Claude Profiles\`), created by a multi-profile launcher such as claude-deck, every sync also reconciles local customization across all data dirs, in the same run and with the same safety rails (no profiles dir means this whole layer is dormant and costs nothing):
 
-- **MCP servers.** The `mcpServers` block of every `claude_desktop_config.json` is fully reconciled. Add a server in one profile: it appears in every profile. Edit a server (change its command, args, env) in one profile: the edit propagates, and if two profiles disagree, the config file edited most recently wins. Remove a server in any profile: the next sync removes it everywhere (run with `--no-deletes` to skip that, or to bring back a server you removed by mistake). A small ledger (`~/.claude/scripts/mcp-ledger.tsv`) remembers which servers were synced everywhere, so "you removed it" is never confused with "a new profile never had it". Every other key of each config file (preferences, account state) is untouched. JSON handling runs in macOS's built-in `osascript` JavaScript runtime (called by absolute path, so a shadowed binary in `/usr/local/bin` can't interfere): still no dependency.
+- **MCP servers.** The `mcpServers` block of every `claude_desktop_config.json` is fully reconciled. Add a server in one profile: it appears in every profile. Edit a server (change its command, args, env) in one profile: the edit propagates, and if two profiles disagree, the config file edited most recently wins. Remove a server in any profile: the next sync removes it everywhere (run with `--no-deletes` to skip that, or to bring back a server you removed by mistake). A small ledger (`~/.claude/scripts/mcp-ledger.tsv`) remembers which servers were synced everywhere, so "you removed it" is never confused with "a new profile never had it". Every other key of each config file (preferences, account state) is untouched. JSON handling runs in macOS's built-in `osascript` JavaScript runtime (called by absolute path, so a shadowed binary in `/usr/local/bin` can't interfere); on Windows it uses PowerShell's built-in `ConvertFrom-Json`/`ConvertTo-Json`: still no dependency.
 - **Desktop Extensions.** Extension folders installed in one profile are copied to the profiles that lack them (best effort: some Claude builds may still want one enable-click in the new profile's settings).
 - **Backed up and revertible.** Config overwrites land in the same run manifest as session writes, so `claude-sync --revert` restores them too, and `--dry-run` previews them.
 
@@ -83,7 +91,7 @@ claude-sync --no-deletes    # sync WITHOUT deletes; deleted items get
 You log into a second account in Claude Desktop and your Claude Code session list is suddenly empty. Your sessions are not gone:
 
 - **Transcripts** live in `~/.claude/projects` and are shared by every account.
-- **The session index** (what the desktop app's session list shows) is per account: `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/local_*.json`.
+- **The session index** (what the desktop app's session list shows) is per account: `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/local_*.json` (Windows: `%APPDATA%\Claude\claude-code-sessions\...`).
 
 `claude-sync` merges those per-account indexes. After a restart of Claude, every account sees the same full, up-to-date list.
 
@@ -102,6 +110,8 @@ You log into a second account in Claude Desktop and your Claude Code session lis
 ---
 
 ## Commands
+
+Shown in macOS spelling; on Windows the same commands work both ways (`claude-sync --dry-run` or `claude-sync -DryRun`).
 
 | Command | What it does |
 |---|---|
@@ -128,7 +138,7 @@ claude-sync --auto-install      # enable
 claude-sync --auto-uninstall    # disable
 ```
 
-This is a LaunchAgent (a small bash loop that checks every few seconds, plus a plist in `~/Library/LaunchAgents/`). No sudo, no admin rights, no system changes. Log at `~/.claude/scripts/claude-sync.log`. The watcher syncs with the default settings, deletes included.
+On macOS this is a LaunchAgent (a small bash loop that checks every few seconds, plus a plist in `~/Library/LaunchAgents/`); on Windows it is a per-user Scheduled Task running the same watcher loop. No sudo, no admin rights, no system changes. Log at `~/.claude/scripts/claude-sync.log`. The watcher syncs with the default settings, deletes included.
 
 ---
 
@@ -166,6 +176,8 @@ Maybe someday. As of mid 2026, Claude Desktop keeps the local Claude Code sessio
 claude-sync --uninstall        # removes the alias and the auto-sync agent
 rm -rf ~/.claude/scripts/claude-sync.sh ~/.claude/scripts/claude-sync.log ~/.claude/scripts/backups
 ```
+
+Windows: `claude-sync -Uninstall`, then delete `~\.claude\scripts\claude-sync.ps1` plus the log, ledgers and `backups\` folder next to it (the uninstall output prints the exact command).
 
 ---
 
