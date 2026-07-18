@@ -27,12 +27,22 @@
 # profile, it propagates). Removing a server from any profile removes it
 # everywhere too, tracked by an MCP ledger so "deleted" is never confused
 # with "never had it"; -NoDeletes skips (and thereby restores) removals.
+# The app's own settings (the "preferences" block: bypass-permissions,
+# scheduled tasks, sidebar mode, ...) are reconciled the same way, but
+# ADD-ONLY: a key present anywhere is propagated everywhere, nothing is
+# ever removed, and on a conflict the newest-mtime config wins, so the
+# last change you made is the one that spreads. The per-account maps
+# (*ByAccount) merge entry by entry, so turning a setting on for one
+# account never drops another account's entry. A profile that has never
+# been opened has no preferences of its own and therefore can never blank
+# a setting for the rest -- the failure mode the MCP ledger guards against.
 # Every other key of each config file is untouched. Extensions stay
 # copy-only (additive). Config writes are backed up into the run's
 # manifest, so -Revert undoes them too. (No claude-deck profiles on this
 # machine yet? The whole layer is dormant and costs nothing.)
-# Logins, cookies, and UI preferences are deliberately never synced:
-# separate accounts are the whole point of profiles. Claude Code
+# Logins and cookies are deliberately never synced: separate accounts are
+# the whole point of profiles. Per-profile window/workspace state (the
+# launchPreview* lists) is left alone for the same reason. Claude Code
 # customization (plugins, skills, hooks, memory in ~\.claude) is already
 # machine-global and needs no syncing.
 #
@@ -344,15 +354,146 @@ function Sync-Extensions {
     }
 }
 
+# Preference keys that are per-profile window/session STATE rather than
+# settings: syncing them would cross-contaminate what each window has open.
+$script:PrefsNoSync = @('launchPreviewPersistedWorkspaces', 'launchPreviewSessionScopedSessions')
+
+function Sync-Preferences {
+    # Reconcile the "preferences" block of claude_desktop_config.json across
+    # every root, so a setting changed in one profile reaches all of them.
+    # ADD-ONLY on purpose: a key present in any config is propagated to the
+    # rest and nothing is ever deleted, so a profile that has never been
+    # opened (and therefore has no preferences at all) can never blank a
+    # setting everywhere. On a genuine conflict the newest-mtime config wins,
+    # which is what makes "the last change I made" the one that spreads.
+    # Per-account maps (*ByAccount) merge entry by entry, so switching a
+    # setting on for one account never drops another account's entry -- the
+    # reason a profile could look "off" even when the flag was on elsewhere.
+    param($Roots)
+
+    $cfgs = New-Object System.Collections.Generic.List[object]
+    foreach ($root in $Roots) {
+        $cfgPath = Join-Path $root 'claude_desktop_config.json'
+        if (-not (Test-Path -LiteralPath $cfgPath)) { continue }
+        $raw = [System.IO.File]::ReadAllText($cfgPath)
+        if (-not $raw.Trim()) { $raw = '{}' }
+        $json = $null
+        try { $json = ConvertFrom-Json $raw } catch {
+            Out-Sync "Preferences: not valid JSON, preference sync skipped: $cfgPath"
+            return
+        }
+        $mt = [long]([DateTimeOffset](Get-Item -LiteralPath $cfgPath).LastWriteTimeUtc).ToUnixTimeSeconds()
+        $cfgs.Add(@{ Path = $cfgPath; Json = $json; Mt = $mt })
+    }
+    if ($cfgs.Count -lt 2) { return }
+
+    # Winner per key. Plain keys: newest mtime wins. Per-account maps:
+    # accumulated entry by entry, newest mtime wins per account.
+    $order    = New-Object System.Collections.Generic.List[string]
+    $chosen   = @{}
+    $chosenMt = @{}
+    $acctVal  = @{}
+    $acctMt   = @{}
+    foreach ($cfg in $cfgs) {
+        $pProp = $cfg.Json.PSObject.Properties['preferences']
+        if (-not $pProp -or $null -eq $pProp.Value) { continue }
+        foreach ($prop in @($pProp.Value.PSObject.Properties)) {
+            $k = $prop.Name
+            if ($script:PrefsNoSync -contains $k) { continue }
+            if ($k -like '*ByAccount') {
+                if (-not $acctVal.ContainsKey($k)) {
+                    $acctVal[$k] = @{}; $acctMt[$k] = @{}; $order.Add($k)
+                }
+                if ($null -ne $prop.Value) {
+                    foreach ($e in @($prop.Value.PSObject.Properties)) {
+                        if ((-not $acctVal[$k].ContainsKey($e.Name)) -or ($cfg.Mt -gt $acctMt[$k][$e.Name])) {
+                            $acctVal[$k][$e.Name] = $e.Value
+                            $acctMt[$k][$e.Name]  = $cfg.Mt
+                        }
+                    }
+                }
+                continue
+            }
+            if (-not $chosen.ContainsKey($k)) {
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt; $order.Add($k)
+            } elseif ($cfg.Mt -gt $chosenMt[$k] -and
+                      (ConvertTo-CanonicalJson $prop.Value) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt
+            }
+        }
+    }
+    # Materialize the merged per-account maps as plain objects.
+    foreach ($k in @($acctVal.Keys)) {
+        $obj = New-Object PSObject
+        foreach ($a in @($acctVal[$k].Keys | Sort-Object)) {
+            $obj | Add-Member -NotePropertyName $a -NotePropertyValue $acctVal[$k][$a]
+        }
+        $chosen[$k] = $obj
+    }
+    if ($order.Count -eq 0) { return }
+
+    # Per-config plan: keys that are missing there or differ from the winner.
+    $plans = New-Object System.Collections.Generic.List[object]
+    foreach ($cfg in $cfgs) {
+        $pProp = $cfg.Json.PSObject.Properties['preferences']
+        $p = if ($pProp) { $pProp.Value } else { $null }
+        $set = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $order) {
+            $has = ($null -ne $p -and $null -ne $p.PSObject.Properties[$k])
+            if (-not $has) { $set.Add($k) }
+            elseif ((ConvertTo-CanonicalJson $p.$k) -ne (ConvertTo-CanonicalJson $chosen[$k])) { $set.Add($k) }
+        }
+        if ($set.Count -gt 0) { $plans.Add(@{ Cfg = $cfg; Set = $set }) }
+    }
+    if ($plans.Count -eq 0) { return }
+
+    if ($DryRun) {
+        foreach ($pl in $plans) {
+            Write-Host ('  would sync preference(s) [{0}] -> {1}' -f (($pl.Set | Select-Object -First 6) -join ','), $pl.Cfg.Path)
+        }
+        return
+    }
+
+    foreach ($pl in $plans) {
+        $cfg = $pl.Cfg
+        Initialize-RunDir
+        $cfgBackupDir = Join-Path $script:RunDir 'configs'
+        New-Item -ItemType Directory -Force -Path $cfgBackupDir | Out-Null
+        $backupPath = Join-Path $cfgBackupDir ($cfg.Path -replace '[:\\/]', '_')
+        # The mcpServers pass may already have backed this file up this run;
+        # that copy is the pre-run original, so never overwrite it.
+        if (-not (Test-Path -LiteralPath $backupPath)) {
+            Copy-Item -LiteralPath $cfg.Path -Destination $backupPath
+        }
+
+        $pProp = $cfg.Json.PSObject.Properties['preferences']
+        if (-not $pProp -or $null -eq $pProp.Value) {
+            $p = New-Object PSObject
+            $cfg.Json | Add-Member -NotePropertyName 'preferences' -NotePropertyValue $p -Force
+        } else {
+            $p = $pProp.Value
+        }
+        foreach ($k in $pl.Set) {
+            if ($null -ne $p.PSObject.Properties[$k]) { $p.$k = $chosen[$k] }
+            else { $p | Add-Member -NotePropertyName $k -NotePropertyValue $chosen[$k] }
+        }
+
+        [System.IO.File]::WriteAllText($cfg.Path, ((ConvertTo-Json -InputObject $cfg.Json -Depth 64) + "`n"))
+        Add-ManifestRow ("overwrote`t{0}`t{1}" -f $cfg.Path, $backupPath)
+        Write-Log ('  preference(s) synced [{0}] -> {1}' -f (($pl.Set | Select-Object -First 6) -join ','), $cfg.Path)
+    }
+}
+
 function Sync-Profiles {
     # Orchestrates the profile layer. Fast, runs before the session
     # machinery, and independent of it (profiles exist even with a single
-    # account). With no "Claude Profiles" dir there is one root and both
-    # steps return immediately.
+    # account). With no "Claude Profiles" dir there is one root and every
+    # step returns immediately.
     param([bool]$Deletes)
     $roots = Get-DataRoots
     if ($roots.Count -lt 2) { return }
     Sync-McpServers -Roots $roots -Deletes $Deletes
+    Sync-Preferences -Roots $roots
     Sync-Extensions -Roots $roots
 }
 
