@@ -1,20 +1,42 @@
 # claude-sync: make local Claude Code sessions visible across all your
 # Claude Desktop accounts on this PC.
 #
-# Claude Desktop keeps a separate Claude Code session index per account
-# (one UUID folder per account under %APPDATA%\Claude\claude-code-sessions).
-# Switch accounts and your session list looks empty, even though every
+# Claude Desktop keeps a separate Claude Code session index per account+org
+# (one <account-uuid>\<org-uuid> folder under
+# %APPDATA%\Claude\claude-code-sessions, small local_*.json files). Switch
+# account or org and your session list looks empty, even though every
 # transcript is still on disk in ~\.claude\projects.
-# This script reconciles the index files across accounts:
-#   - the copy with the newest lastActivityAt wins,
-#   - archived-in-one means archived-everywhere,
-#   - every overwrite is backed up first and can be undone with -Revert,
-#   - deletions propagate by default: a session fully synced once,
-#     then deleted in ANY account and untouched since, is deleted everywhere
-#     (backed up first, revertible). -NoDeletes turns that off for a run;
-#     because a skipped deletion is re-copied from the surviving accounts,
-#     -NoDeletes doubles as the restore path for an accidental delete.
-#     See the ledger machinery below.
+#
+# v4 (Windows) fixes this STRUCTURALLY instead of copying files around:
+#   - UNIFY (one-time, needs Claude fully closed): the union of every
+#     <account>\<org>'s local_*.json moves into one real folder,
+#     claude-code-sessions\_shared, and every <account>\<org> folder is
+#     replaced by a directory junction to _shared. One physical list;
+#     every account and org reads and writes the same files; new sessions
+#     appear everywhere instantly; nothing is ever copied again.
+#     Union conflicts resolve like v3 did: newest lastActivityAt wins,
+#     archived-in-one means archived-everywhere. The whole tree is
+#     backed up first (junction-aware) and -Revert restores it fully.
+#   - SELF-HEAL (every run, safe with Claude open): scans every transcript
+#     in ~\.claude\projects and, for any session that has a transcript but
+#     no list entry in _shared (the app sometimes never writes one after a
+#     restart or a rewound session), generates a minimal entry from the
+#     transcript itself (title from the first user message or the recorded
+#     custom title; cwd, timestamps and model read from the transcript).
+#     Existing entries are never edited or deleted; transcripts are never
+#     touched. A heal ledger (heal-ledger.tsv) remembers every session id
+#     ever listed, so an entry the user deletes in the app is never
+#     resurrected from its transcript.
+#   - NEWCOMERS: when the app later creates a fresh real <account>\<org>
+#     folder (first login of a new account/org), the next run with Claude
+#     closed absorbs its entries into _shared and junctions it too.
+# The v3 copy machinery (winner distribution, deletion ledger) is gone for
+# sessions: with one physical list there is nothing to reconcile and a
+# delete in the app is already a delete everywhere. ledger.tsv is read one
+# last time during UNIFY (its ids seed the heal ledger, so sessions deleted
+# after their last full v3 sync are not resurrected) and never written
+# again. The macOS script (claude-sync.sh) still implements the v3 copy
+# design; this junction design is Windows-only for now.
 #
 # It also syncs customization across PROFILES: multi-profile launchers
 # (claude-deck) give each profile its own data dir under
@@ -47,12 +69,23 @@
 # machine-global and needs no syncing.
 #
 # Deliberately NOT synced either: %APPDATA%\Claude\local-agent-mode-sessions
-# (a parallel index tree that appeared in mid-2026 builds). It is empty so
-# far and its semantics are unknown; syncing it blindly could corrupt agent
-# state. Revisit once Claude ships whatever it is for.
+# (a parallel index tree that appeared in mid-2026 builds). Its semantics
+# are unknown; restructuring it blindly could corrupt agent state.
+# Revisit once Claude ships whatever it is for.
 #
-# Feature parity with claude-sync.sh v3.0.0 (the macOS script). JSON
-# handling uses PowerShell's built-in ConvertFrom-Json/ConvertTo-Json:
+# Safety notes for the structural work (learned the hard way elsewhere):
+#   - A junction is removed with the non-recursive Directory.Delete (or an
+#     rmdir), NEVER Remove-Item -Recurse: recursing through a reparse point
+#     deletes the TARGET's contents, i.e. the shared index itself.
+#   - Restructure and structural revert refuse to run while Claude Desktop
+#     is up. Detection is by ExecutablePath (MSIX \WindowsApps\Claude_* or
+#     legacy Squirrel \AnthropicClaude\app-*), never by process name: the
+#     Claude Code CLI is also a claude.exe and must not count.
+#   - Existing list files are only ever regex-scanned, never JSON-parsed:
+#     real files exist whose enabledMcpTools map has case-colliding keys
+#     that ConvertFrom-Json rejects.
+#
+# JSON handling uses PowerShell's built-in ConvertFrom-Json/ConvertTo-Json:
 # no dependencies. Works on Windows PowerShell 5.1 and PowerShell 7+.
 #
 # https://github.com/SMKeramati/claude-sync
@@ -77,7 +110,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '3.0.0'
+$ScriptVersion = '4.0.0'
 
 # $env:APPDATA fallback keeps the script parseable on non-Windows for testing.
 $AppData = if ($env:APPDATA) { $env:APPDATA } else { Join-Path $HOME 'AppData\Roaming' }
@@ -90,6 +123,8 @@ $DefaultRoot = if ($env:CLAUDE_SYNC_DEFAULT_ROOT) { $env:CLAUDE_SYNC_DEFAULT_ROO
                else { Join-Path $AppData 'Claude' }
 $ProfilesDir = if ($env:CLAUDE_SYNC_PROFILES_DIR) { $env:CLAUDE_SYNC_PROFILES_DIR }
                else { Join-Path $AppData 'Claude Profiles' }
+$ProjectsDir = if ($env:CLAUDE_SYNC_PROJECTS_DIR) { $env:CLAUDE_SYNC_PROJECTS_DIR }
+               else { Join-Path $HOME '.claude\projects' }
 $CanonicalDir = if ($env:CLAUDE_SYNC_HOME) { $env:CLAUDE_SYNC_HOME }
                 else { Join-Path $HOME '.claude\scripts' }
 
@@ -99,14 +134,15 @@ $BackupsDir         = Join-Path $CanonicalDir 'backups'
 $LedgerPath         = Join-Path $CanonicalDir 'ledger.tsv'
 $LedgerAccountsPath = Join-Path $CanonicalDir '.ledger-accounts.tsv'
 $McpLedgerPath      = Join-Path $CanonicalDir 'mcp-ledger.tsv'
+$HealLedgerPath     = Join-Path $CanonicalDir 'heal-ledger.tsv'
 $RcBegin            = '# >>> claude-sync shortcut >>>'
 $RcEnd              = '# <<< claude-sync shortcut <<<'
 $TaskName           = 'claude-sync-watcher'
 $KeepBackups        = 10
 
 # Backups for one run live in one dir with one manifest, shared by the
-# profile config sync and the session plan executor, so -Revert undoes a
-# whole run no matter which layer wrote. Created lazily on first write.
+# profile config sync and the session module, so -Revert undoes a whole
+# run no matter which layer wrote. Created lazily on first write.
 $script:RunDir       = $null
 $script:ManifestPath = $null
 
@@ -127,6 +163,9 @@ function Out-Sync {
 function Initialize-RunDir {
     if ($script:RunDir) { return }
     $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    # Two runs inside the same second must not share a dir: a merged
+    # manifest would make one -Revert undo both runs at once.
+    while (Test-Path -LiteralPath (Join-Path $BackupsDir "$epoch")) { $epoch++ }
     $script:RunDir = Join-Path $BackupsDir "$epoch"
     $script:ManifestPath = Join-Path $script:RunDir 'manifest.tsv'
     New-Item -ItemType Directory -Force -Path $script:RunDir | Out-Null
@@ -140,13 +179,33 @@ function Add-ManifestRow {
     [System.IO.File]::AppendAllText($script:ManifestPath, $Row + "`n")
 }
 
-function Get-AccountDirs {
-    # One UUID folder per account. Skip non-account dirs like "_shared"
-    # (left behind by other sync experiments/tools); they are not accounts
-    # and must never be written into.
-    @(Get-ChildItem -Path $SessionsDir -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -notlike '_*' })
+function Get-LongDirPath {
+    # Expand 8.3 short components (C:\Users\MOHAMM~1\...) of an existing
+    # directory path. Windows stores junction targets long-form, so every
+    # path we compare against a junction target must be long-form too.
+    # Component walk via GetFileSystemEntries: a short name used as the
+    # search pattern matches its own directory entry, and the returned
+    # path carries the real long name.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $Path }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        if ($full -notmatch '~') { return $full }
+        $root = [System.IO.Path]::GetPathRoot($full)
+        $cur = $root.TrimEnd('\')
+        foreach ($part in $full.Substring($root.Length).Split('\')) {
+            if (-not $part) { continue }
+            $hit = @([System.IO.Directory]::GetFileSystemEntries("$cur\", $part))
+            if ($hit.Count -ge 1) { $cur = $hit[0] } else { $cur = "$cur\$part" }
+        }
+        return $cur
+    } catch { return $Path }
 }
+
+# Canonicalize once: a short-form %APPDATA%/%TEMP% from the environment
+# would otherwise make every junction-target comparison fail.
+$SessionsDir = Get-LongDirPath -Path $SessionsDir
+$SharedDir   = Join-Path $SessionsDir '_shared'
 
 # ---------- profile customization sync ------------------------------------
 function Get-DataRoots {
@@ -497,121 +556,761 @@ function Sync-Profiles {
     Sync-Extensions -Roots $roots
 }
 
-# ---------- session ledger -------------------------------------------------
-# Ledger: fname -> lastActivityAt recorded at the end of the last successful
-# non-dry sync, for every session that was present in EVERY account at that
-# time. Malformed rows (wrong column count, non-numeric ts) are skipped and
-# never treated as a match. Missing/empty file is normal (first run).
-function Get-Ledger {
-    $ledger = @{}
-    if (-not (Test-Path -LiteralPath $LedgerPath)) { return $ledger }
-    foreach ($line in @(Get-Content -LiteralPath $LedgerPath -ErrorAction SilentlyContinue)) {
-        if (-not $line) { continue }
-        $parts = $line -split "`t"
-        if ($parts.Count -ne 2) { continue }
-        if ($parts[1] -notmatch '^\d+$') { continue }
-        $ledger[$parts[0]] = [long]$parts[1]
+# ---------- session module: one _shared index behind junctions -------------
+# UNIFY once (Claude closed), then SELF-HEAL every run. See the header
+# comment for the design. Everything here is Set-StrictMode clean and
+# 5.1-safe; the structural entry points enable strict mode for themselves.
+
+$script:UuidNameRe  = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+$script:LocalNameRe = '^local_([0-9a-fA-F-]{36})\.json$'
+
+function Test-ClaudeDesktopRunning {
+    # TRUE iff any live process belongs to the Claude DESKTOP install.
+    # Match by ExecutablePath, never by name: the Claude Code CLI is also a
+    # claude.exe (under ...\claude-code\<ver>\claude.exe) and must not
+    # count, while Desktop and all its Electron children live under the
+    # MSIX package dir (or the legacy Squirrel dir). When the sessions dir
+    # is overridden to a throwaway tree (tests), the check is skipped: it
+    # exists to protect the real tree only. The FORCE_RUNNING hook lets
+    # tests exercise the postpone paths; it can only make the tool MORE
+    # conservative, never less.
+    if ($env:CLAUDE_SYNC_TEST_FORCE_RUNNING) { return $true }
+    $realSessions = Get-LongDirPath -Path (Join-Path (Join-Path $AppData 'Claude') 'claude-code-sessions')
+    if ($env:CLAUDE_SYNC_SESSIONS_DIR -and ($SessionsDir -ine $realSessions)) { return $false }
+    $paths = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction Stop)) {
+            if ($p.ExecutablePath) { $paths.Add([string]$p.ExecutablePath) }
+        }
+    } catch {
+        foreach ($p in @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue)) {
+            $exe = $null
+            try { $exe = $p.Path } catch { $exe = $null }
+            if ($exe) { $paths.Add([string]$exe) }
+        }
     }
-    return $ledger
+    foreach ($path in $paths) {
+        if ($path -match '\\WindowsApps\\Claude_' -or $path -match '\\AnthropicClaude\\app-') { return $true }
+    }
+    return $false
 }
 
-# Companion file: the account names that counted as "everywhere" when the
-# ledger was last written (one name per line). An account added AFTER that
-# write must not make every ledgered session look "deleted somewhere", so
-# absence is judged only against this recorded set. Missing or empty file =
-# fail safe: no deletion candidates at all.
-function Get-LedgerAccounts {
-    $names = @{}
-    if (-not (Test-Path -LiteralPath $LedgerAccountsPath)) { return $names }
-    foreach ($line in @(Get-Content -LiteralPath $LedgerAccountsPath -ErrorAction SilentlyContinue)) {
-        if (-not $line) { continue }
-        if ($line.Contains("`t")) { continue }
-        $names[$line] = $true
+function Remove-DirectorySafe {
+    # Junction-aware delete. A reparse point is unlinked with the
+    # NON-recursive Directory.Delete, which can never descend into the
+    # target (Remove-Item -Recurse through a junction deletes the target's
+    # contents -- here that would be the shared index itself). Real dirs are
+    # walked manually for the same reason: a real dir may CONTAIN junctions.
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ([bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        [System.IO.Directory]::Delete($Path, $false)
+    } else {
+        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+            if ($child.PSIsContainer) { Remove-DirectorySafe -Path $child.FullName }
+            else { Remove-Item -LiteralPath $child.FullName -Force }
+        }
+        Remove-Item -LiteralPath $Path -Force
     }
-    return $names
+    if (Test-Path -LiteralPath $Path) { throw "Failed to remove: $Path" }
 }
 
-function Update-Ledger {
-    # Called at the end of EVERY successful non-dry sync, changes or not
-    # (the ledger is what makes a future deletion pass able to tell
-    # "deleted" apart from "never synced here yet"). Records fname + newest
-    # lastActivityAt for every session present, after this run's writes, in
-    # every account. Reads the post-write state from disk rather than
-    # trusting the pre-run inventory, so a run that only partially completes
-    # cannot write a false row. Written atomically (temp file + move).
-    param($Accounts)
-    $post = @{}
-    foreach ($account in $Accounts) {
-        foreach ($org in @(Get-ChildItem -Path $account.FullName -Directory -ErrorAction SilentlyContinue)) {
-            foreach ($f in @(Get-ChildItem -Path $org.FullName -Filter 'local_*.json' -File -ErrorAction SilentlyContinue)) {
-                $raw = [System.IO.File]::ReadAllText($f.FullName)
-                $ts = [long]0
-                if ($raw -match '"lastActivityAt":(\d+)') { $ts = [long]$Matches[1] }
-                if (-not $post.ContainsKey($f.Name)) {
-                    $post[$f.Name] = @{ MaxTs = $ts; Accts = @{} }
+function Test-JunctionTo {
+    param([string]$Path, [string]$Target)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    $t = @($item.Target)
+    if ($t.Count -eq 0 -or -not $t[0]) { return $false }
+    $got = [string]$t[0]
+    if ($got.StartsWith('\\?\')) { $got = $got.Substring(4) }
+    $want = $Target
+    if ($want.StartsWith('\\?\')) { $want = $want.Substring(4) }
+    $want = Get-LongDirPath -Path $want
+    return ($got.TrimEnd('\') -ieq $want.TrimEnd('\'))
+}
+
+function New-JunctionSafe {
+    # New-Item can silently no-op (a lesson from claude-deck), so trust only
+    # the re-read: the path must exist, be a reparse point, and resolve to
+    # the target. One clear-and-retry, then fail loudly (the unify catch
+    # rolls the whole tree back).
+    param([string]$Path, [string]$Target)
+    try { New-Item -ItemType Junction -Path $Path -Value $Target -ErrorAction Stop | Out-Null } catch { }
+    if (-not (Test-JunctionTo -Path $Path -Target $Target)) {
+        if (Test-Path -LiteralPath $Path) { Remove-DirectorySafe -Path $Path }
+        New-Item -ItemType Junction -Path $Path -Value $Target -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-JunctionTo -Path $Path -Target $Target)) {
+        throw "Could not create junction: $Path -> $Target"
+    }
+}
+
+function Copy-TreeSnapshot {
+    # Junction-aware recursive copy: junctions become rows in $JunRows
+    # (relative path + target), never followed; real files and dirs are
+    # copied (Copy-Item keeps file mtimes).
+    param([string]$Src, [string]$Dst, [string]$Rel, $JunRows)
+    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
+    foreach ($f in @(Get-ChildItem -LiteralPath $Src -File -Force -ErrorAction SilentlyContinue)) {
+        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $Dst $f.Name)
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $Src -Directory -Force -ErrorAction SilentlyContinue)) {
+        $childRel = if ($Rel) { Join-Path $Rel $d.Name } else { $d.Name }
+        if ([bool]($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $t = @($d.Target)
+            $tgt = if ($t.Count -gt 0 -and $t[0]) { [string]$t[0] } else { '' }
+            $JunRows.Add("$childRel`t$tgt")
+        } else {
+            Copy-TreeSnapshot -Src $d.FullName -Dst (Join-Path $Dst $d.Name) -Rel $childRel -JunRows $JunRows
+        }
+    }
+}
+
+function Backup-SessionsTree {
+    # Full snapshot of the sessions tree into this run's backup dir, plus
+    # one 'tree' manifest row, written BEFORE any mutation, so -Revert (and
+    # the unify rollback path) can always restore the exact pre-run tree.
+    Initialize-RunDir
+    $treeDir = Join-Path $script:RunDir 'sessions-tree'
+    $junTsv  = "$treeDir.junctions.tsv"
+    New-Item -ItemType Directory -Force -Path $treeDir | Out-Null
+    $junRows = New-Object System.Collections.Generic.List[string]
+    Copy-TreeSnapshot -Src $SessionsDir -Dst $treeDir -Rel '' -JunRows $junRows
+    if ($junRows.Count -eq 0) { [System.IO.File]::WriteAllText($junTsv, '') }
+    else { [System.IO.File]::WriteAllText($junTsv, (($junRows -join "`n") + "`n")) }
+    Add-ManifestRow ("tree`t{0}`t{1}" -f $SessionsDir, $treeDir)
+}
+
+function Copy-TreeRestore {
+    param([string]$Src, [string]$Dst)
+    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
+    foreach ($f in @(Get-ChildItem -LiteralPath $Src -File -Force -ErrorAction SilentlyContinue)) {
+        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $Dst $f.Name) -Force
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $Src -Directory -Force -ErrorAction SilentlyContinue)) {
+        Copy-TreeRestore -Src $d.FullName -Dst (Join-Path $Dst $d.Name)
+    }
+}
+
+function Get-RelFileMap {
+    # relpath -> true for every file under $Dir, keys built by the same
+    # Join-Path walk the wipe below uses. Never string-prefix arithmetic:
+    # enumerated FullNames can come back long-form under a short-form
+    # root, which silently breaks Substring-based keys.
+    param([string]$Dir, [string]$BaseRel, $Map)
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Force -ErrorAction SilentlyContinue)) {
+        $fileRel = if ($BaseRel) { Join-Path $BaseRel $f.Name } else { $f.Name }
+        $Map[$fileRel.ToLowerInvariant()] = $true
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $Dir -Directory -Force -ErrorAction SilentlyContinue)) {
+        $childRel = if ($BaseRel) { Join-Path $BaseRel $d.Name } else { $d.Name }
+        Get-RelFileMap -Dir $d.FullName -BaseRel $childRel -Map $Map
+    }
+}
+
+function Clear-TreeForRestore {
+    # Junction-aware wipe with salvage: a file created AFTER the snapshot
+    # (its relative path is not in $SnapFiles) is MOVED into the salvage
+    # dir instead of deleted, so a revert can never destroy data the
+    # snapshot does not carry. Junctions are only ever unlinked.
+    # NOTE: PowerShell variable names are case-insensitive; a local $rel
+    # here would BE the $Rel parameter and accumulate across iterations.
+    param([string]$Dir, [string]$Rel, $SnapFiles, [string]$SalvageDir, [ref]$Salvaged)
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Force -ErrorAction SilentlyContinue)) {
+        $fileRel = if ($Rel) { Join-Path $Rel $f.Name } else { $f.Name }
+        if ($SalvageDir -and -not $SnapFiles.ContainsKey($fileRel.ToLowerInvariant())) {
+            $dst = Join-Path $SalvageDir $fileRel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+            Move-Item -LiteralPath $f.FullName -Destination $dst -Force
+            $Salvaged.Value++
+        } else {
+            Remove-Item -LiteralPath $f.FullName -Force
+        }
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $Dir -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ([bool]($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            [System.IO.Directory]::Delete($d.FullName, $false)
+        } else {
+            $childRel = if ($Rel) { Join-Path $Rel $d.Name } else { $d.Name }
+            Clear-TreeForRestore -Dir $d.FullName -Rel $childRel -SnapFiles $SnapFiles -SalvageDir $SalvageDir -Salvaged $Salvaged
+            Remove-Item -LiteralPath $d.FullName -Force
+        }
+    }
+}
+
+function Restore-SessionsTree {
+    # Put the live tree back exactly as the snapshot recorded it: wipe the
+    # current children (junction-safe; anything newer than the snapshot is
+    # salvaged, not deleted, when a salvage dir is given), copy the
+    # snapshot back, recreate the recorded junctions. The wipe only starts
+    # after the snapshot has been verified present. Returns the number of
+    # salvaged files.
+    param([string]$TreeBackupDir, [string]$LiveDir, [string]$SalvageDir = '')
+    if (-not $LiveDir) { throw 'Restore-SessionsTree: empty live dir' }
+    if (-not (Test-Path -LiteralPath $TreeBackupDir)) { throw "Tree backup missing: $TreeBackupDir" }
+    $junTsv = "$TreeBackupDir.junctions.tsv"
+    New-Item -ItemType Directory -Force -Path $LiveDir | Out-Null
+    $snapFiles = @{}
+    Get-RelFileMap -Dir $TreeBackupDir -BaseRel '' -Map $snapFiles
+    $salvaged = 0
+    Clear-TreeForRestore -Dir $LiveDir -Rel '' -SnapFiles $snapFiles -SalvageDir $SalvageDir -Salvaged ([ref]$salvaged)
+    Copy-TreeRestore -Src $TreeBackupDir -Dst $LiveDir
+    if (Test-Path -LiteralPath $junTsv) {
+        foreach ($line in @(Get-Content -LiteralPath $junTsv -ErrorAction SilentlyContinue)) {
+            if (-not $line) { continue }
+            $parts = $line -split "`t"
+            if ($parts.Count -ne 2 -or -not $parts[0] -or -not $parts[1]) { continue }
+            $jPath = Join-Path $LiveDir $parts[0]
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $jPath) | Out-Null
+            if (Test-Path -LiteralPath $jPath) { Remove-DirectorySafe -Path $jPath }
+            New-JunctionSafe -Path $jPath -Target $parts[1]
+        }
+    }
+    return $salvaged
+}
+
+function Read-EntryMeta {
+    # Regex-only field extraction from an index file. Existing entries are
+    # NEVER JSON-parsed: real files exist whose enabledMcpTools map has
+    # case-colliding keys that ConvertFrom-Json rejects.
+    param([string]$Path)
+    $raw = [System.IO.File]::ReadAllText($Path)
+    $ts = [long]0
+    if ($raw -match '"lastActivityAt":(\d+)') { $ts = [long]$Matches[1] }
+    $arch = $false
+    if ($raw -match '"isArchived":(true|false)') { $arch = ($Matches[1] -eq 'true') }
+    return @{ Ts = $ts; Arch = $arch }
+}
+
+function Get-SessionTreeState {
+    # One read-only walk: which org dirs are real, which already junction to
+    # _shared, which junction somewhere unexpected, and whether _shared
+    # exists as a real dir.
+    $realOrgs      = New-Object System.Collections.Generic.List[object]
+    $oddJunctions  = New-Object System.Collections.Generic.List[string]
+    $junctionCount = 0
+    $accountCount  = 0
+    foreach ($acct in @(Get-ChildItem -Path $SessionsDir -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($acct.Name -notmatch $script:UuidNameRe) { continue }
+        if ([bool]($acct.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $oddJunctions.Add($acct.FullName); continue
+        }
+        $accountCount++
+        foreach ($org in @(Get-ChildItem -Path $acct.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($org.Name -notmatch $script:UuidNameRe) { continue }
+            if ([bool]($org.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                if (Test-JunctionTo -Path $org.FullName -Target $SharedDir) { $junctionCount++ }
+                else { $oddJunctions.Add($org.FullName) }
+            } else {
+                $realOrgs.Add([PSCustomObject]@{ Path = $org.FullName; Account = $acct.Name; Org = $org.Name })
+            }
+        }
+    }
+    $sharedExists = $false
+    $sharedIsRealDir = $false
+    if (Test-Path -LiteralPath $SharedDir) {
+        $sh = Get-Item -LiteralPath $SharedDir -Force
+        $sharedExists = $true
+        $sharedIsRealDir = -not [bool]($sh.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    }
+    return [PSCustomObject]@{
+        RealOrgs = $realOrgs; OddJunctions = $oddJunctions
+        JunctionCount = $junctionCount; AccountCount = $accountCount
+        SharedExists = $sharedExists; SharedIsRealDir = $sharedIsRealDir
+    }
+}
+
+function Invoke-SessionUnify {
+    # The structural pass: absorb every real <account>\<org> folder's
+    # entries into _shared (newest lastActivityAt wins, archived-in-one
+    # means archived-everywhere), then replace the folder with a junction.
+    # Idempotent: already-junctioned orgs are not in $State.RealOrgs, and a
+    # later fresh real org folder (a newcomer) takes exactly this same path.
+    # The plan is computed once and then either printed (dry run) or
+    # executed, so narration and writes can never disagree.
+    param($State)
+    Set-StrictMode -Version 2
+
+    if ($State.SharedExists -and -not $State.SharedIsRealDir) {
+        throw "_shared exists but is not a real directory, refusing to touch anything: $SharedDir"
+    }
+
+    # ---- gather candidates per filename --------------------------------
+    $byName         = @{}   # fname -> List of @{Path;Ts;Arch;Mt;IsShared}
+    $orgCounts      = @{}   # org path -> entry count
+    $orgsWithStrays = @{}   # org path -> short description
+    $copyTotal      = 0
+    foreach ($org in $State.RealOrgs) {
+        $entries = @(Get-ChildItem -LiteralPath $org.Path -Force -ErrorAction SilentlyContinue)
+        $strays = @($entries | Where-Object { $_.PSIsContainer -or ($_.Name -notmatch $script:LocalNameRe) })
+        if ($strays.Count -gt 0) {
+            $orgsWithStrays[$org.Path] = (@($strays | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', ')
+        }
+        $n = 0
+        foreach ($f in @($entries | Where-Object { (-not $_.PSIsContainer) -and ($_.Name -match $script:LocalNameRe) })) {
+            $meta = Read-EntryMeta -Path $f.FullName
+            $n++; $copyTotal++
+            if (-not $byName.ContainsKey($f.Name)) { $byName[$f.Name] = New-Object System.Collections.Generic.List[object] }
+            $byName[$f.Name].Add(@{ Path = $f.FullName; Ts = $meta.Ts; Arch = $meta.Arch
+                                    Mt = [long]([DateTimeOffset]$f.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+                                    IsShared = $false })
+        }
+        $orgCounts[$org.Path] = $n
+    }
+    if ($State.SharedExists) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $SharedDir -File -Force -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match $script:LocalNameRe })) {
+            $meta = Read-EntryMeta -Path $f.FullName
+            if (-not $byName.ContainsKey($f.Name)) { $byName[$f.Name] = New-Object System.Collections.Generic.List[object] }
+            $byName[$f.Name].Add(@{ Path = $f.FullName; Ts = $meta.Ts; Arch = $meta.Arch
+                                    Mt = [long]([DateTimeOffset]$f.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+                                    IsShared = $true })
+        }
+    }
+
+    # ---- pick winners ---------------------------------------------------
+    $moves = New-Object System.Collections.Generic.List[object]
+    $conflicts = 0
+    $archFlips = 0
+    foreach ($fname in @($byName.Keys | Sort-Object)) {
+        $cands = $byName[$fname]
+        $winner = $null
+        $minTs = $cands[0].Ts; $maxTs = $cands[0].Ts; $archOr = $false
+        foreach ($c in $cands) {
+            if ($null -eq $winner) { $winner = $c }
+            elseif ($c.Ts -gt $winner.Ts) { $winner = $c }
+            elseif ($c.Ts -eq $winner.Ts -and $c.Mt -gt $winner.Mt) { $winner = $c }
+            if ($c.Ts -lt $minTs) { $minTs = $c.Ts }
+            if ($c.Ts -gt $maxTs) { $maxTs = $c.Ts }
+            if ($c.Arch) { $archOr = $true }
+        }
+        if ($maxTs -gt $minTs) { $conflicts++ }
+        $flip = ($archOr -and -not $winner.Arch)
+        if ($flip) { $archFlips++ }
+        if ($winner.IsShared -and -not $flip) { continue }   # already in place
+        $moves.Add(@{ Fname = $fname; SrcPath = $winner.Path; Flip = $flip })
+    }
+
+    $junctionable = New-Object System.Collections.Generic.List[object]
+    foreach ($org in $State.RealOrgs) {
+        if (-not $orgsWithStrays.ContainsKey($org.Path)) { $junctionable.Add($org) }
+    }
+
+    # ---- dry run: narrate the plan --------------------------------------
+    if ($DryRun) {
+        Write-Host "Restructure plan for $($SessionsDir):"
+        if (-not $State.SharedExists) { Write-Host "  would create the shared index dir: $SharedDir" }
+        Write-Host ('  would place {0} unique session entries into _shared ({1} per-org copies collapse into them; {2} had diverging copies, resolved by newest activity; {3} archive flags propagated)' -f `
+            $byName.Count, $copyTotal, $conflicts, $archFlips)
+        foreach ($org in $junctionable) {
+            Write-Host ('  would replace {0}\{1} ({2} entries) with a junction -> _shared' -f $org.Account, $org.Org, $orgCounts[$org.Path])
+        }
+        foreach ($orgPath in @($orgsWithStrays.Keys | Sort-Object)) {
+            Write-Host ('  would LEAVE REAL (unexpected content: {0}): {1}' -f $orgsWithStrays[$orgPath], $orgPath)
+        }
+        Write-Host '  the whole tree would be backed up first (claude-sync -Revert restores it)'
+        return
+    }
+
+    # ---- execute --------------------------------------------------------
+    if (Test-ClaudeDesktopRunning) {
+        throw 'Claude Desktop is running; refusing to restructure the sessions tree.'
+    }
+    Write-Log ("Restructuring sessions index: {0} entries -> _shared, {1} org folder(s) to junction..." -f $byName.Count, $junctionable.Count)
+    Backup-SessionsTree
+    try {
+        if (-not (Test-Path -LiteralPath $SharedDir)) {
+            New-Item -ItemType Directory -Force -Path $SharedDir | Out-Null
+        }
+        foreach ($mv in $moves) {
+            $dst = Join-Path $SharedDir $mv.Fname
+            if ($mv.Flip) {
+                $raw = [System.IO.File]::ReadAllText($mv.SrcPath)
+                [System.IO.File]::WriteAllText($dst, $raw.Replace('"isArchived":false', '"isArchived":true'))
+                (Get-Item -LiteralPath $dst).LastWriteTimeUtc = (Get-Item -LiteralPath $mv.SrcPath).LastWriteTimeUtc
+            } else {
+                [System.IO.File]::Copy($mv.SrcPath, $dst, $true)
+            }
+        }
+        foreach ($org in $junctionable) {
+            # Belt and suspenders: nothing may be lost by the removal.
+            foreach ($f in @(Get-ChildItem -LiteralPath $org.Path -File -Force -ErrorAction SilentlyContinue)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $SharedDir $f.Name))) {
+                    throw "entry was not absorbed into _shared: $($f.FullName)"
                 }
-                $e = $post[$f.Name]
-                if ($ts -gt $e.MaxTs) { $e.MaxTs = $ts }
-                $e.Accts[$account.Name] = $true
+            }
+            Remove-DirectorySafe -Path $org.Path
+            New-JunctionSafe -Path $org.Path -Target $SharedDir
+        }
+        # Seed the heal ledger: every id visible now, plus every id the old
+        # v3 ledger ever saw fully synced. An id whose entry is absent from
+        # the union but present in the v3 ledger was deleted by the user
+        # after its last full sync -- seeding it keeps self-heal from
+        # resurrecting it out of its transcript.
+        $ids = Get-HealLedger
+        foreach ($fname in @($byName.Keys)) {
+            if ($fname -match $script:LocalNameRe) { $ids[$Matches[1].ToLowerInvariant()] = $true }
+        }
+        if (Test-Path -LiteralPath $LedgerPath) {
+            foreach ($line in @(Get-Content -LiteralPath $LedgerPath -ErrorAction SilentlyContinue)) {
+                if ($line -and $line -match '^local_([0-9a-fA-F-]{36})\.json\t') {
+                    $ids[$Matches[1].ToLowerInvariant()] = $true
+                }
+            }
+        }
+        Save-HealLedger -Ids $ids
+    } catch {
+        Write-Log ("RESTRUCTURE FAILED: {0}" -f $_)
+        Write-Log "Restoring the pre-run tree from this run's backup..."
+        $null = Restore-SessionsTree -TreeBackupDir (Join-Path $script:RunDir 'sessions-tree') -LiveDir $SessionsDir
+        Write-Log 'Restored. The sessions tree is back to its pre-run state.'
+        throw
+    }
+    Write-Log ('Unified: {0} session entries in _shared; {1} org folder(s) junctioned ({2} diverging copies resolved by newest activity, {3} archive flags propagated).' -f `
+        $byName.Count, $junctionable.Count, $conflicts, $archFlips)
+    foreach ($orgPath in @($orgsWithStrays.Keys | Sort-Object)) {
+        Write-Log ('  left REAL, unexpected content ({0}): {1}' -f $orgsWithStrays[$orgPath], $orgPath)
+    }
+}
+
+# ---------- self-heal: rebuild missing entries from transcripts ------------
+function ConvertTo-EpochMs {
+    param([string]$Iso)
+    try {
+        return [long]([DateTimeOffset]::Parse($Iso, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUnixTimeMilliseconds()
+    } catch { return [long]0 }
+}
+
+function ConvertFrom-JsonEscapedString {
+    # $S is the inside of a well-formed JSON string literal (captured by
+    # regex); wrapping it back into a tiny JSON doc is the safest unescape.
+    param([string]$S)
+    try { return (ConvertFrom-Json ('{"v":"' + $S + '"}')).v } catch { return $S }
+}
+
+function Read-FileTailText {
+    # Last chunk of a (possibly live, possibly huge) file, opened with a
+    # ReadWrite share so an open transcript never fails the scan. A partial
+    # first multibyte char decodes as garbage and is harmless: only complete
+    # matches later in the chunk are used.
+    param([string]$Path, [int]$MaxBytes = 65536)
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $len = $fs.Length
+        if ($len -le 0) { return '' }
+        $take = [int]([Math]::Min([long]$MaxBytes, $len))
+        $fs.Seek(-$take, [System.IO.SeekOrigin]::End) | Out-Null
+        $buf = New-Object byte[] $take
+        $read = $fs.Read($buf, 0, $take)
+        return [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+    } finally { $fs.Close() }
+}
+
+function Read-TranscriptMeta {
+    # Streaming metadata extraction from a transcript: head lines give the
+    # custom title / first user message, cwd, first timestamp and model;
+    # the tail chunk gives the last timestamp (and any late rename). The
+    # transcript is only ever read, line by line, never loaded whole.
+    param([string]$Path)
+    $title = $null; $titleSource = 'auto'; $summaryTitle = $null
+    $cwd = $null; $createdIso = $null; $model = $null
+    $isSidechain = $false
+
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $reader = New-Object System.IO.StreamReader($fs)
+    try {
+        $lineNo = 0
+        $sawMessageEntry = $false
+        while (-not $reader.EndOfStream -and $lineNo -lt 250) {
+            $line = $reader.ReadLine()
+            $lineNo++
+            if (-not $line) { continue }
+            if ($line.StartsWith('{"type":"custom-title"') -and $line -match '"customTitle":"((?:[^"\\]|\\.)*)"') {
+                $t = ConvertFrom-JsonEscapedString $Matches[1]
+                $t = ($t -replace '\s+', ' ').Trim()
+                if ($t) { $title = $t; $titleSource = 'custom' }
+            }
+            if ((-not $summaryTitle) -and $line.StartsWith('{"type":"summary"') -and $line -match '"summary":"((?:[^"\\]|\\.)*)"') {
+                $summaryTitle = ConvertFrom-JsonEscapedString $Matches[1]
+            }
+            if ((-not $createdIso) -and $line -match '"timestamp":"([0-9TZ:.+-]{10,40})"') { $createdIso = $Matches[1] }
+            if ((-not $cwd) -and $line -match '"cwd":"((?:[^"\\]|\\.)*)"') {
+                $cwd = ConvertFrom-JsonEscapedString $Matches[1]
+            }
+            if ((-not $model) -and $line -match '"model":"(claude-[A-Za-z0-9.\[\]_-]{1,60})"') { $model = $Matches[1] }
+            if ($line.StartsWith('{"parentUuid"')) {
+                if (-not $sawMessageEntry) {
+                    $sawMessageEntry = $true
+                    # Only the file's own first message entry decides
+                    # sidechain-ness; quoted content later can't.
+                    if ($line.Contains('"isSidechain":true')) { $isSidechain = $true; break }
+                }
+                if (($titleSource -ne 'custom') -and (-not $title) -and $line.Contains('"type":"user"') -and
+                    (-not $line.Contains('"isMeta":true')) -and (-not $line.Contains('"type":"tool_result"'))) {
+                    $cand = $null
+                    if ($line -match '"role":"user","content":"((?:[^"\\]|\\.)*)"') {
+                        $cand = ConvertFrom-JsonEscapedString $Matches[1]
+                    } elseif ($line -match '"type":"text","text":"((?:[^"\\]|\\.)*)"') {
+                        $cand = ConvertFrom-JsonEscapedString $Matches[1]
+                    }
+                    if ($cand) {
+                        $cand = ($cand -replace '\s+', ' ').Trim()
+                        $bad = ($cand -eq '') -or $cand.StartsWith('Caveat:') -or $cand.StartsWith('<command-') -or
+                               $cand.StartsWith('<local-command') -or $cand.StartsWith('[Request interrupted') -or
+                               $cand.StartsWith('<system')
+                        if (-not $bad) {
+                            if ($cand.Length -gt 60) { $cand = $cand.Substring(0, 60).TrimEnd() }
+                            $title = $cand
+                        }
+                    }
+                }
+            }
+            if ($title -and ($titleSource -eq 'custom') -and $cwd -and $createdIso -and $model) { break }
+        }
+    } finally { $reader.Close() }
+
+    if ((-not $title) -and $summaryTitle) {
+        $t = ($summaryTitle -replace '\s+', ' ').Trim()
+        if ($t) {
+            if ($t.Length -gt 60) { $t = $t.Substring(0, 60).TrimEnd() }
+            $title = $t
+        }
+    }
+
+    $lastIso = $null
+    if (-not $isSidechain) {
+        $tailText = Read-FileTailText -Path $Path
+        $mts = [regex]::Matches($tailText, '"timestamp":"([0-9TZ:.+-]{10,40})"')
+        if ($mts.Count -gt 0) { $lastIso = $mts[$mts.Count - 1].Groups[1].Value }
+        $cts = [regex]::Matches($tailText, '"customTitle":"((?:[^"\\]|\\.)*)"')
+        if ($cts.Count -gt 0) {
+            $t = ConvertFrom-JsonEscapedString $cts[$cts.Count - 1].Groups[1].Value
+            $t = ($t -replace '\s+', ' ').Trim()
+            if ($t) {
+                if ($t.Length -gt 60) { $t = $t.Substring(0, 60).TrimEnd() }
+                $title = $t; $titleSource = 'custom'
             }
         }
     }
 
+    $item = Get-Item -LiteralPath $Path
+    $createdMs = [long]0
+    if ($createdIso) { $createdMs = ConvertTo-EpochMs $createdIso }
+    if ($createdMs -le 0) { $createdMs = [long]([DateTimeOffset]$item.CreationTimeUtc).ToUnixTimeMilliseconds() }
+    $lastMs = [long]0
+    if ($lastIso) { $lastMs = ConvertTo-EpochMs $lastIso }
+    if ($lastMs -le 0) { $lastMs = [long]([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeMilliseconds() }
+    if ($lastMs -lt $createdMs) { $lastMs = $createdMs }
+    if (-not $cwd) { $cwd = [string]$HOME }
+    if (-not $model) { $model = 'claude-opus-4-8' }
+    return @{ Title = $title; TitleSource = $titleSource; Cwd = $cwd
+              CreatedMs = $createdMs; LastMs = $lastMs; Model = $model; IsSidechain = $isSidechain }
+}
+
+function Get-HealLedger {
+    # Every session id self-heal has ever seen listed (or generated). An id
+    # here whose entry is gone was deleted by the user in the app; without
+    # this file every deletion would be resurrected from its transcript on
+    # the next run.
+    $ids = @{}
+    if (-not (Test-Path -LiteralPath $HealLedgerPath)) { return $ids }
+    foreach ($line in @(Get-Content -LiteralPath $HealLedgerPath -ErrorAction SilentlyContinue)) {
+        if ($line -and $line -match $script:UuidNameRe) { $ids[$line.ToLowerInvariant()] = $true }
+    }
+    return $ids
+}
+
+function Save-HealLedger {
+    # Atomic (temp + move), backed into the run manifest, and skipped
+    # entirely when nothing changed so idle runs stay write-free.
+    param($Ids)
+    $lines = @($Ids.Keys | Sort-Object)
+    $new = ''
+    if ($lines.Count -gt 0) { $new = (($lines -join "`n") + "`n") }
+    $old = ''
+    if (Test-Path -LiteralPath $HealLedgerPath) { $old = [System.IO.File]::ReadAllText($HealLedgerPath) }
+    if ($new -eq $old) { return }
     New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
-    $tmp = "$LedgerPath.tmp.$PID"
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($fname in ($post.Keys | Sort-Object)) {
-        if ($post[$fname].Accts.Count -ge $Accounts.Count) {
-            $lines.Add("$fname`t$($post[$fname].MaxTs)")
+    Initialize-RunDir
+    if ($old -ne '') {
+        $bak = Join-Path $script:RunDir 'heal-ledger.tsv.pre'
+        if (-not (Test-Path -LiteralPath $bak)) {
+            [System.IO.File]::WriteAllText($bak, $old)
+            Add-ManifestRow ("overwrote`t{0}`t{1}" -f $HealLedgerPath, $bak)
         }
+    } else {
+        Add-ManifestRow ("created`t{0}" -f $HealLedgerPath)
     }
-    if ($lines.Count -eq 0) { [System.IO.File]::WriteAllText($tmp, '') }
-    else { [System.IO.File]::WriteAllText($tmp, (($lines -join "`n") + "`n")) }
-    Move-Item -LiteralPath $tmp -Destination $LedgerPath -Force
-
-    # Record which accounts this ledger considers "everywhere", so a future
-    # deletion pass can tell a brand-new account (not part of this set)
-    # apart from an account that genuinely had a ledgered session removed.
-    $tmpAcct = "$LedgerAccountsPath.tmp.$PID"
-    $acctLines = New-Object System.Collections.Generic.List[string]
-    foreach ($account in $Accounts) { $acctLines.Add($account.Name) }
-    if ($acctLines.Count -eq 0) { [System.IO.File]::WriteAllText($tmpAcct, '') }
-    else { [System.IO.File]::WriteAllText($tmpAcct, (($acctLines -join "`n") + "`n")) }
-    Move-Item -LiteralPath $tmpAcct -Destination $LedgerAccountsPath -Force
+    $tmp = "$HealLedgerPath.tmp.$PID"
+    [System.IO.File]::WriteAllText($tmp, $new)
+    Move-Item -LiteralPath $tmp -Destination $HealLedgerPath -Force
 }
 
-# ---------- sync core ------------------------------------------------------
-# Two passes over the whole tree, O(total files): every index file is read
-# exactly once and all copies are planned from that inventory (never
-# src-account x dst-account loops).
-function Get-Inventory {
-    # Pass 1: one row per <account>\<org>\local_*.json. The index JSON is
-    # compact and single-line; regex-extract the two fields sync decisions
-    # need (lastActivityAt, isArchived).
-    param($Accounts)
-    $inv = New-Object System.Collections.Generic.List[object]
-    foreach ($account in $Accounts) {
-        foreach ($org in @(Get-ChildItem -Path $account.FullName -Directory -ErrorAction SilentlyContinue)) {
-            foreach ($f in @(Get-ChildItem -Path $org.FullName -Filter 'local_*.json' -File -ErrorAction SilentlyContinue)) {
-                $raw = [System.IO.File]::ReadAllText($f.FullName)
-                $ts = [long]0
-                if ($raw -match '"lastActivityAt":(\d+)') { $ts = [long]$Matches[1] }
-                $arch = $false
-                if ($raw -match '"isArchived":(true|false)') { $arch = ($Matches[1] -eq 'true') }
-                $inv.Add([PSCustomObject]@{
-                    Fname   = $f.Name
-                    Ts      = $ts
-                    Arch    = $arch
-                    Path    = $f.FullName
-                    Account = $account.Name
-                    Org     = $org.Name
-                })
+function Invoke-SessionHeal {
+    # For every transcript with no list entry in _shared and no heal-ledger
+    # record, generate a minimal entry the app can render and resume.
+    # Additive only: existing entries are never edited or deleted, and
+    # transcripts are never touched. Safe with Claude open (the app reads
+    # the index at launch). $ListedOverride lets a pre-restructure dry run
+    # preview the heal against the ids the restructure WOULD leave listed.
+    param([hashtable]$ListedOverride = $null)
+    Set-StrictMode -Version 2
+    if (($null -eq $ListedOverride) -and -not (Test-Path -LiteralPath $SharedDir)) { return }
+    $listed = @{}
+    if ($null -ne $ListedOverride) {
+        $listed = $ListedOverride
+    } else {
+        foreach ($f in @(Get-ChildItem -LiteralPath $SharedDir -File -Force -ErrorAction SilentlyContinue)) {
+            if ($f.Name -match $script:LocalNameRe) { $listed[$Matches[1].ToLowerInvariant()] = $true }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $ProjectsDir)) {
+        Out-Sync "Self-heal: transcripts dir not found ($ProjectsDir), nothing to scan."
+        return
+    }
+    $seen = Get-HealLedger
+    # Ids the v3 ledger saw fully synced are tombstones forever: an id
+    # there with no entry now was deleted by the user post-sync. Merging
+    # here (not only at unify time) keeps dry runs and real runs agreeing.
+    if (Test-Path -LiteralPath $LedgerPath) {
+        foreach ($line in @(Get-Content -LiteralPath $LedgerPath -ErrorAction SilentlyContinue)) {
+            if ($line -and $line -match '^local_([0-9a-fA-F-]{36})\.json\t') {
+                $seen[$Matches[1].ToLowerInvariant()] = $true
             }
         }
     }
-    return ,$inv
+    $plan = New-Object System.Collections.Generic.List[object]
+    $scanned = 0; $skipSeen = 0; $skipEmpty = 0; $skipSide = 0; $skipNoTitle = 0
+    foreach ($projDir in @(Get-ChildItem -Path $ProjectsDir -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($f in @(Get-ChildItem -Path $projDir.FullName -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)) {
+            if ($f.BaseName -notmatch $script:UuidNameRe) { continue }
+            $scanned++
+            $id = $f.BaseName.ToLowerInvariant()
+            if ($listed.ContainsKey($id)) { continue }
+            if ($seen.ContainsKey($id)) { $skipSeen++; continue }
+            if ($f.Length -eq 0) { $skipEmpty++; continue }
+            $tm = Read-TranscriptMeta -Path $f.FullName
+            if ($tm.IsSidechain) { $skipSide++; continue }
+            if (-not $tm.Title) { $skipNoTitle++; continue }
+            $plan.Add(@{ Id = $f.BaseName; Meta = $tm })
+        }
+    }
+
+    if ($DryRun) {
+        if ($plan.Count -eq 0) {
+            Write-Host ('Self-heal: nothing to generate ({0} transcripts scanned).' -f $scanned)
+        } else {
+            Write-Host ('Self-heal: would generate {0} missing list entries from transcripts:' -f $plan.Count)
+            foreach ($p in $plan) { Write-Host ('  would create: local_{0}.json  [{1}]' -f $p.Id, $p.Meta.Title) }
+        }
+        return
+    }
+
+    $made = 0
+    foreach ($p in $plan) {
+        $m = $p.Meta
+        $dst = Join-Path $SharedDir ('local_{0}.json' -f $p.Id)
+        if (Test-Path -LiteralPath $dst) { continue }
+        $obj = [ordered]@{
+            sessionId       = ('local_{0}' -f $p.Id)
+            cliSessionId    = $p.Id
+            cwd             = $m.Cwd
+            originCwd       = $m.Cwd
+            lastFocusedAt   = [long]$m.LastMs
+            createdAt       = [long]$m.CreatedMs
+            lastActivityAt  = [long]$m.LastMs
+            model           = $m.Model
+            effort          = 'high'
+            isArchived      = $false
+            title           = $m.Title
+            titleSource     = $m.TitleSource
+            permissionMode  = 'bypassPermissions'
+            enabledMcpTools = @{}
+        }
+        $json = ConvertTo-Json -InputObject $obj -Compress -Depth 8
+        Initialize-RunDir
+        [System.IO.File]::WriteAllText($dst, $json)
+        try {
+            (Get-Item -LiteralPath $dst).LastWriteTimeUtc = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.LastMs).UtcDateTime
+        } catch { }
+        Add-ManifestRow ("created`t{0}" -f $dst)
+        $listed[$p.Id.ToLowerInvariant()] = $true
+        $made++
+        Write-Log ('  generated from transcript: local_{0}.json  [{1}]' -f $p.Id, $m.Title)
+    }
+
+    # Every id listed right now becomes 'seen': if the user later deletes
+    # its entry in the app, self-heal will never bring it back.
+    $changed = $false
+    foreach ($id in @($listed.Keys)) {
+        if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $changed = $true }
+    }
+    if ($changed) { Save-HealLedger -Ids $seen }
+
+    if ($made -gt 0) {
+        Write-Log ('Self-heal: generated {0} entries ({1} transcripts scanned; skipped {2} seen-before, {3} sidechain, {4} empty, {5} with no usable first message).' -f `
+            $made, $scanned, $skipSeen, $skipSide, $skipEmpty, $skipNoTitle)
+    } else {
+        Out-Sync ('Self-heal: nothing to generate ({0} transcripts scanned).' -f $scanned)
+    }
 }
 
+function Invoke-SessionModule {
+    # Session work for one run: restructure when needed and possible
+    # (Claude fully closed), then self-heal. The restructure is never
+    # attempted under a live app: writing into a tree the app has open
+    # is externally silent but can be overwritten or half-read.
+    Set-StrictMode -Version 2
+    if (-not (Test-Path $SessionsDir)) {
+        Out-Sync "Sessions folder not found: $SessionsDir"
+        Out-Sync 'Open Claude Desktop, go to Claude Code, and start one session first.'
+        return 1
+    }
+    $state = Get-SessionTreeState
+    foreach ($odd in $state.OddJunctions) {
+        Out-Sync "  NOTE: junction to an unexpected target, left alone: $odd"
+    }
+    $needsStructure = (($state.RealOrgs.Count -gt 0) -or (-not $state.SharedExists))
+    if ($needsStructure) {
+        if ($DryRun) {
+            Invoke-SessionUnify -State $state
+            # Preview the heal too, against the ids the restructure would
+            # leave listed, so the dry run shows the WHOLE first real run.
+            $wouldList = @{}
+            foreach ($org in $state.RealOrgs) {
+                foreach ($f in @(Get-ChildItem -Path $org.Path -Filter 'local_*.json' -File -ErrorAction SilentlyContinue)) {
+                    if ($f.Name -match $script:LocalNameRe) { $wouldList[$Matches[1].ToLowerInvariant()] = $true }
+                }
+            }
+            if ($state.SharedExists) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $SharedDir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue)) {
+                    if ($f.Name -match $script:LocalNameRe) { $wouldList[$Matches[1].ToLowerInvariant()] = $true }
+                }
+            }
+            Invoke-SessionHeal -ListedOverride $wouldList
+            return 0
+        } elseif (Test-ClaudeDesktopRunning) {
+            Out-Sync ('Claude Desktop is running: the restructure ({0} org folder(s) -> _shared junctions) is postponed. Close Claude Desktop fully and run claude-sync again.' -f $state.RealOrgs.Count)
+        } else {
+            Invoke-SessionUnify -State $state
+            $state = Get-SessionTreeState
+        }
+    }
+    if ($state.SharedExists) {
+        Invoke-SessionHeal
+        $n = @(Get-ChildItem -LiteralPath $SharedDir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
+        Out-Sync ('Sessions: one unified index, {0} entries in _shared, visible to every account and org.' -f $n)
+    } else {
+        Out-Sync 'Self-heal skipped: no _shared index yet (it runs after the restructure).'
+    }
+    return 0
+}
+
+# ---------- sync entry point ------------------------------------------------
 function Invoke-Sync {
     $doDeletes = -not $NoDeletes
 
@@ -619,227 +1318,16 @@ function Invoke-Sync {
     # machinery (profiles exist even with a single account or no sessions).
     Sync-Profiles -Deletes $doDeletes
 
-    if (-not (Test-Path $SessionsDir)) {
-        Out-Sync "Sessions folder not found: $SessionsDir"
-        Out-Sync 'Open Claude Desktop, go to Claude Code, and start one session first.'
-        return 1
-    }
-
-    $accounts = @(Get-AccountDirs)
-    if ($accounts.Count -lt 2) {
-        Out-Sync 'Only one account folder found. Nothing to sync.'
-        Out-Sync "Tip: log in to your other account in Claude Desktop, start one throwaway Claude Code session (a plain 'hi' is enough), quit Claude, then run claude-sync again."
-        return 0
-    }
-
-    $inventory = Get-Inventory -Accounts $accounts
-
-    # Pass 2: reduce per session. Winner = copy with max lastActivityAt
-    # (ties: first seen). ArchOR = archived in at least one account (the OR
-    # is deliberate: archived in even one account means archived everywhere;
-    # known accepted caveat: un-archiving cannot propagate). PresentIn and
-    # MaxTs feed the deletion pass.
-    $sessions  = @{}
-    $invByPath = @{}
-    $invByName = @{}
-    foreach ($e in $inventory) {
-        $invByPath[$e.Path] = $e
-        if (-not $invByName.ContainsKey($e.Fname)) {
-            $invByName[$e.Fname] = New-Object System.Collections.Generic.List[object]
-        }
-        $invByName[$e.Fname].Add($e)
-        if (-not $sessions.ContainsKey($e.Fname)) {
-            $sessions[$e.Fname] = @{
-                WinnerPath = $e.Path
-                WinnerTs   = $e.Ts
-                WinnerArch = $e.Arch
-                ArchOR     = $e.Arch
-                PresentIn  = @{ $e.Account = $true }
-                MaxTs      = $e.Ts
-            }
-        } else {
-            $s = $sessions[$e.Fname]
-            if ($e.Ts -gt $s.WinnerTs) {
-                $s.WinnerTs   = $e.Ts
-                $s.WinnerPath = $e.Path
-                $s.WinnerArch = $e.Arch
-            }
-            if ($e.Arch) { $s.ArchOR = $true }
-            $s.PresentIn[$e.Account] = $true
-            if ($e.Ts -gt $s.MaxTs) { $s.MaxTs = $e.Ts }
-        }
-    }
-
-    # ---------- delete propagation (default; skipped by -NoDeletes) -------
-    # A session qualifies for deletion everywhere iff: it is in the ledger
-    # (fully synced across all accounts once), it is now absent from at
-    # least one account that BOTH was part of the last ledger write AND
-    # still exists on disk, and no surviving copy is newer than the ledger's
-    # recorded time (otherwise it was used after the last full sync, so the
-    # deletion may predate that activity: keep it and say why). The
-    # intersection matters: judging absence against a brand-new account
-    # would qualify the whole history for deletion, and judging it against
-    # a vanished account would delete everything idle since the last sync.
-    # Empty intersection = no candidates: fail safe. The activity guard
-    # still looks at ALL current copies, including ones in new accounts.
-    $deleteRows      = New-Object System.Collections.Generic.List[object]
-    $deletedSessions = @{}
-    if ($doDeletes) {
-        $ledger = Get-Ledger
-        $recordedAccounts = Get-LedgerAccounts
-        $absenceAccounts = New-Object System.Collections.Generic.List[string]
-        foreach ($account in $accounts) {
-            if ($recordedAccounts.ContainsKey($account.Name)) { $absenceAccounts.Add($account.Name) }
-        }
-        foreach ($fname in @($sessions.Keys)) {
-            if (-not $ledger.ContainsKey($fname)) { continue }   # never fully synced: never delete
-            $s = $sessions[$fname]
-            $absentSomewhere = $false
-            foreach ($name in $absenceAccounts) {
-                if (-not $s.PresentIn.ContainsKey($name)) { $absentSomewhere = $true; break }
-            }
-            if (-not $absentSomewhere) { continue }              # present in every counted account
-            if ($s.MaxTs -gt $ledger[$fname]) {
-                Out-Sync "  Kept $fname everywhere: a surviving copy is newer than the last full sync, so the deletion may predate that activity."
-                continue
-            }
-            foreach ($e in $invByName[$fname]) {
-                $deleteRows.Add([PSCustomObject]@{
-                    Verb = 'delete'; Fname = $fname; Dst = $e.Path
-                    Account = $e.Account; Org = $e.Org
-                })
-            }
-            $deletedSessions[$fname] = 1
-            # Deletion candidates must never be resurrected by this same
-            # run: drop them before the distribute plan ever sees them.
-            $sessions.Remove($fname)
-        }
-    }
-
-    # ---------- plan ------------------------------------------------------
-    # Cross every destination org dir with every surviving session, decide
-    # from the inventory alone (files are never re-read here). Sessions are
-    # distributed into every org folder of every account, same as the macOS
-    # script: the index JSON carries no org identity, and Claude shows one
-    # merged list per account.
-    $planRows = New-Object System.Collections.Generic.List[object]
-    foreach ($account in $accounts) {
-        foreach ($org in @(Get-ChildItem -Path $account.FullName -Directory -ErrorAction SilentlyContinue)) {
-            foreach ($fname in $sessions.Keys) {
-                $s = $sessions[$fname]
-                $dst = Join-Path $org.FullName $fname
-                if (-not $invByPath.ContainsKey($dst)) {
-                    $planRows.Add([PSCustomObject]@{
-                        Verb = 'create'; Fname = $fname; Dst = $dst
-                        Account = $account.Name; Org = $org.Name
-                        IsNew = $true; IsUpd = $false; IsArch = $false
-                    })
-                    continue
-                }
-                $d = $invByPath[$dst]
-                $stale     = ($d.Ts -lt $s.WinnerTs)
-                $needsArch = ($s.ArchOR -and -not $d.Arch)
-                if (-not $stale -and -not $needsArch) { continue }
-                $planRows.Add([PSCustomObject]@{
-                    Verb = 'overwrite'; Fname = $fname; Dst = $dst
-                    Account = $account.Name; Org = $org.Name
-                    IsNew = $false; IsUpd = $stale; IsArch = $needsArch
-                })
-            }
-        }
-    }
-    foreach ($row in $deleteRows) { $planRows.Add($row) }
-
-    # ---------- nothing to do ----------------------------------------------
-    if ($planRows.Count -eq 0) {
-        $msg = "Everything already in sync. $($sessions.Count) total sessions across $($accounts.Count) accounts."
-        if ($DryRun) {
-            Write-Host "Dry run: everything already in sync. $($sessions.Count) total sessions across $($accounts.Count) accounts."
-        } else {
-            Write-Log $msg
-            Update-Ledger -Accounts $accounts
-            if ($script:RunDir) {
-                # The profile layer wrote even though sessions were clean.
-                Write-Log "Sync complete. Backup: $($script:RunDir) (claude-sync -Revert undoes this run)"
-            }
-        }
-        return 0
-    }
-
-    # ---------- dry run -----------------------------------------------------
+    $rc = Invoke-SessionModule
     if ($DryRun) {
-        Write-Host "Dry run across $($accounts.Count) accounts. Planned actions:"
-        foreach ($row in $planRows) {
-            Write-Host "  would $($row.Verb): $($row.Dst)"
-        }
-        Write-PlanSummary -PlanRows $planRows -Sessions $sessions -Accounts $accounts
         Write-Host 'Nothing was written.'
-        return 0
+        return $rc
     }
-
-    # ---------- execute -----------------------------------------------------
-    Write-Log "Syncing sessions across $($accounts.Count) accounts..."
-    Initialize-RunDir
-
-    # Staging: sessions archived somewhere whose winner says
-    # "isArchived":false get a flipped copy; that copy becomes canonical.
-    # The winner's LastWriteTime is kept so copy mtimes stay meaningful.
-    $stagingDir = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-sync-staging-' + [guid]::NewGuid().ToString('N'))
-    $stagedAny = $false
-    foreach ($fname in @($sessions.Keys)) {
-        $s = $sessions[$fname]
-        $s.Canonical = $s.WinnerPath
-        if ($s.ArchOR -and -not $s.WinnerArch) {
-            $raw = [System.IO.File]::ReadAllText($s.WinnerPath)
-            if ($raw.Contains('"isArchived":false')) {
-                if (-not $stagedAny) {
-                    New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-                    $stagedAny = $true
-                }
-                $stagedPath = Join-Path $stagingDir $fname
-                [System.IO.File]::WriteAllText($stagedPath, $raw.Replace('"isArchived":false', '"isArchived":true'))
-                (Get-Item -LiteralPath $stagedPath).LastWriteTime = (Get-Item -LiteralPath $s.WinnerPath).LastWriteTime
-                $s.Canonical = $stagedPath
-            }
-        }
-    }
-
-    try {
-        foreach ($row in $planRows) {
-            if ($row.Verb -eq 'create') {
-                if (-not (Test-Path -LiteralPath $row.Dst)) {
-                    Copy-Item -LiteralPath $sessions[$row.Fname].Canonical -Destination $row.Dst
-                    Add-ManifestRow ("created`t$($row.Dst)")
-                    continue
-                }
-                # Destination appeared after the inventory pass: fall through
-                # to the backed-up overwrite below.
-            }
-            if ($row.Verb -eq 'delete') {
-                # A dst that vanished between planning and here is done.
-                if (Test-Path -LiteralPath $row.Dst) {
-                    $backupPath = Join-Path (Join-Path (Join-Path $script:RunDir $row.Account) $row.Org) $row.Fname
-                    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null
-                    Copy-Item -LiteralPath $row.Dst -Destination $backupPath
-                    Remove-Item -LiteralPath $row.Dst -Force
-                    Add-ManifestRow ("deleted`t$($row.Dst)`t$backupPath")
-                }
-                continue
-            }
-            # Overwrite: back the current file up first (mirroring
-            # <account>\<org>\ so -Revert can put it back).
-            $backupPath = Join-Path (Join-Path (Join-Path $script:RunDir $row.Account) $row.Org) $row.Fname
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null
-            Copy-Item -LiteralPath $row.Dst -Destination $backupPath
-            Copy-Item -LiteralPath $sessions[$row.Fname].Canonical -Destination $row.Dst -Force
-            Add-ManifestRow ("overwrote`t$($row.Dst)`t$backupPath")
-        }
-    }
-    finally {
-        if ($stagedAny) { Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
+    if ($rc -ne 0) { return $rc }
 
     # Prune old backup runs (keep the newest N, reverted ones included).
+    # Run dirs contain only real copies (junctions are recorded as tsv
+    # rows, never materialized), so a recursive delete here is safe.
     if (Test-Path $BackupsDir) {
         $runs = @(Get-ChildItem -Path $BackupsDir -Directory |
                   Where-Object { $_.Name -match '^\d+(\.reverted)?$' } |
@@ -851,48 +1339,23 @@ function Invoke-Sync {
         }
     }
 
-    Write-PlanSummary -PlanRows $planRows -Sessions $sessions -Accounts $accounts
-    Update-Ledger -Accounts $accounts
-    Write-Log "Sync complete. Backup: $($script:RunDir) (claude-sync -Revert undoes this run)"
-    return 0
-}
-
-function Write-PlanSummary {
-    # Honest counts: unique sessions, never file copies. "3 new, 5 updated"
-    # means 3 sessions and 5 sessions, not the 36 files behind them.
-    param($PlanRows, $Sessions, $Accounts)
-
-    $acctNew = @{}; $acctUpd = @{}; $acctDel = @{}
-    $newS = @{}; $updS = @{}; $arcS = @{}; $delS = @{}
-    foreach ($row in $PlanRows) {
-        $ak = $row.Account
-        if (-not $acctNew.ContainsKey($ak)) { $acctNew[$ak] = @{}; $acctUpd[$ak] = @{}; $acctDel[$ak] = @{} }
-        if ($row.Verb -eq 'create')      { $acctNew[$ak][$row.Fname] = 1; $newS[$row.Fname] = 1 }
-        elseif ($row.Verb -eq 'delete')  { $acctDel[$ak][$row.Fname] = 1; $delS[$row.Fname] = 1 }
-        else {
-            if ($row.IsUpd) { $acctUpd[$ak][$row.Fname] = 1; $updS[$row.Fname] = 1 }
-            if ($row.IsArch) { $arcS[$row.Fname] = 1 }
-        }
+    if ($script:RunDir) {
+        Write-Log "Sync complete. Backup: $($script:RunDir) (claude-sync -Revert undoes this run)"
+    } else {
+        Write-Log 'Sync complete. Nothing needed changing.'
     }
-    foreach ($ak in ($acctNew.Keys | Sort-Object)) {
-        $line = '  {0}: +{1} new, {2} updated' -f $ak, $acctNew[$ak].Count, $acctUpd[$ak].Count
-        if ($acctDel[$ak].Count -gt 0) { $line += ', -{0} deleted' -f $acctDel[$ak].Count }
-        Out-Sync $line
-    }
-
-    $summary = '{0} new session(s) appeared somewhere, {1} session(s) updated to a newer state, {2} session(s) archived everywhere (was archived in at least one account)' -f `
-        $newS.Count, $updS.Count, $arcS.Count
-    if ($delS.Count -gt 0) {
-        $summary += ', {0} session(s) deleted everywhere (deleted in at least one account)' -f $delS.Count
-    }
-    Out-Sync "$summary. $($Sessions.Count) total sessions across $($Accounts.Count) accounts."
+    return $rc
 }
 
 # ---------- revert ---------------------------------------------------------
 function Invoke-Revert {
-    # Undo the most recent sync run: delete files it created, restore files
-    # it overwrote or deleted, then mark the backup dir .reverted so a
-    # second -Revert targets the run before it.
+    # Undo the most recent sync run: replay its manifest in REVERSE order
+    # (later writes undo first, which is what makes the structural rows
+    # compose with file rows), then mark the backup dir .reverted so a
+    # second -Revert targets the run before it. A run that restructured the
+    # tree ('tree' row) restores the whole pre-run tree, junction-aware,
+    # and -- like the restructure itself -- only with Claude fully closed.
+    Set-StrictMode -Version 2
     $runs = @()
     if (Test-Path $BackupsDir) {
         $runs = @(Get-ChildItem -Path $BackupsDir -Directory |
@@ -912,10 +1375,21 @@ function Invoke-Revert {
         return 1
     }
     $manifestPath = Join-Path $run.FullName 'manifest.tsv'
+    $lines = @(Get-Content -LiteralPath $manifestPath)
+
+    $hasTree = $false
+    foreach ($line in $lines) {
+        if ($line -and ($line -split "`t")[0] -eq 'tree') { $hasTree = $true; break }
+    }
+    if ($hasTree -and (Test-ClaudeDesktopRunning)) {
+        Write-Host 'This revert restores the sessions tree structure and must run with Claude Desktop fully closed. Close Claude and run -Revert again.'
+        return 1
+    }
 
     Write-Log "Reverting sync run $($run.Name)..."
-    $removed = 0; $restored = 0; $undeleted = 0
-    foreach ($line in @(Get-Content -LiteralPath $manifestPath)) {
+    $removed = 0; $restored = 0; $undeleted = 0; $trees = 0
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = $lines[$i]
         if (-not $line) { continue }
         $parts = $line -split "`t"
         switch ($parts[0]) {
@@ -937,10 +1411,20 @@ function Invoke-Revert {
                 Copy-Item -LiteralPath $parts[2] -Destination $parts[1] -Force
                 $undeleted++
             }
+            'tree' {
+                $salvageDir = Join-Path $run.FullName 'revert-salvage'
+                $salvaged = Restore-SessionsTree -TreeBackupDir $parts[2] -LiveDir $parts[1] -SalvageDir $salvageDir
+                if ($salvaged -gt 0) {
+                    Write-Log ("  {0} file(s) newer than this run's snapshot were moved aside to {1} (nothing deleted)." -f $salvaged, $salvageDir)
+                }
+                $trees++
+            }
         }
     }
     Rename-Item -LiteralPath $run.FullName -NewName ($run.Name + '.reverted')
-    Write-Log "Reverted: removed $removed created file(s), restored $restored overwritten file(s), restored $undeleted deleted file(s)."
+    $msg = "Reverted: removed $removed created file(s), restored $restored overwritten file(s), restored $undeleted deleted file(s)."
+    if ($trees -gt 0) { $msg += " Restored the full pre-run sessions tree ($trees snapshot(s), junctions included)." }
+    Write-Log $msg
     Write-Log "Backup kept at $($run.Name).reverted. Run -Revert again to undo the previous run."
     return 0
 }
@@ -949,13 +1433,13 @@ function Invoke-Revert {
 function Invoke-Watch {
     Write-Log '[watcher] Watcher started.'
     while ($true) {
-        # Wait for the Claude Desktop main process to be running.
-        while (-not (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)) {
+        # Wait for Claude Desktop (by install path, so the Claude Code CLI,
+        # which is also a claude.exe, never counts).
+        while (-not (Test-ClaudeDesktopRunning)) {
             Start-Sleep -Seconds 5
         }
-        $procId = @(Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)[0].Id
-        Write-Log "[watcher] Claude detected (PID $procId). Waiting for quit..."
-        while (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue) {
+        Write-Log '[watcher] Claude Desktop detected. Waiting for quit...'
+        while (Test-ClaudeDesktopRunning) {
             Start-Sleep -Seconds 2
         }
         # Brief grace period for helpers to clean up.
@@ -1057,7 +1541,7 @@ function Uninstall-ClaudeSync {
     Set-Content -Path $profilePath -Value $out
     Write-Host 'Removed. Open a new terminal for it to take effect.'
     Write-Host 'To delete the script, log, ledgers and backups too:'
-    Write-Host "  Remove-Item `"$CanonicalPath`", `"$LogPath`", `"$LedgerPath`", `"$LedgerAccountsPath`", `"$McpLedgerPath`"; Remove-Item -Recurse `"$BackupsDir`""
+    Write-Host "  Remove-Item `"$CanonicalPath`", `"$LogPath`", `"$LedgerPath`", `"$LedgerAccountsPath`", `"$McpLedgerPath`", `"$HealLedgerPath`"; Remove-Item -Recurse `"$BackupsDir`""
 }
 
 # ---------- status / help ---------------------------------------------------
@@ -1084,14 +1568,30 @@ function Show-Status {
         Write-Host '  (not found: open Claude Code in Claude Desktop once)'
         return
     }
-    foreach ($a in Get-AccountDirs) {
-        $n = @(Get-ChildItem -Path $a.FullName -Recurse -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
-        Write-Host ('  account {0}: {1} session index file(s)' -f $a.Name, $n)
+    $state = Get-SessionTreeState
+    if ($state.SharedExists) {
+        $n = @(Get-ChildItem -LiteralPath $SharedDir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
+        Write-Host ('  unified: {0} session entries in _shared; {1} org junction(s) across {2} account(s)' -f `
+            $n, $state.JunctionCount, $state.AccountCount)
     }
-    $shared = Join-Path $SessionsDir '_shared'
-    if (Test-Path $shared) {
-        $n = @(Get-ChildItem -Path $shared -Recurse -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
-        Write-Host ('  _shared (not an account folder, untouched): {0} file(s)' -f $n)
+    if ($state.RealOrgs.Count -gt 0) {
+        Write-Host ('  pending restructure: {0} real org folder(s); run claude-sync with Claude Desktop closed' -f $state.RealOrgs.Count)
+        foreach ($org in $state.RealOrgs) {
+            $n = @(Get-ChildItem -Path $org.Path -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
+            Write-Host ('    {0}\{1}: {2} entries' -f $org.Account, $org.Org, $n)
+        }
+    }
+    foreach ($odd in $state.OddJunctions) {
+        Write-Host "  junction to an unexpected target (left alone): $odd"
+    }
+    $healN = (Get-HealLedger).Count
+    if ($healN -gt 0) { Write-Host ('  heal ledger: {0} session id(s) tracked' -f $healN) }
+    if (Test-Path -LiteralPath $ProjectsDir) {
+        $tn = 0
+        foreach ($pd in @(Get-ChildItem -Path $ProjectsDir -Directory -ErrorAction SilentlyContinue)) {
+            $tn += @(Get-ChildItem -Path $pd.FullName -Filter '*.jsonl' -File -ErrorAction SilentlyContinue).Count
+        }
+        Write-Host ('  transcripts on disk: {0}' -f $tn)
     }
     if (Test-Path $CanonicalPath) {
         Write-Host "Script: installed at $CanonicalPath"
@@ -1113,8 +1613,8 @@ function Show-Status {
     }
     $lastSync = $null
     if (Test-Path $LogPath) {
-        # 'Sync complete' is v3's completion line; 'Done.' covers logs from
-        # the v1/v2 scripts so history stays readable.
+        # 'Sync complete' is the completion line since v3; 'Done.' covers
+        # logs from the v1/v2 scripts so history stays readable.
         $doneLines = @(Get-Content -Path $LogPath -ErrorAction SilentlyContinue |
                        Where-Object { $_ -match '\] (Sync complete|Done\.)' })
         if ($doneLines.Count -gt 0 -and $doneLines[$doneLines.Count - 1] -match '^\[([^\]]+)\]') {
@@ -1132,26 +1632,37 @@ function Show-Status {
 function Show-Help {
     Write-Host @"
 claude-sync v$ScriptVersion
-Make local Claude Code sessions visible across all Claude Desktop accounts,
-and keep customization (MCP servers, Desktop Extensions) in sync across
-profiles (claude-deck). Newest session state wins; archived-in-one means
-archived-everywhere; overwrites are backed up and revertible. Deletions
-propagate by default: delete a session in any account (or an MCP server in
-any profile) and the next sync deletes it everywhere, after a backup. MCP
-server edits propagate too: when profiles disagree on a server's
-definition, the profile config edited most recently wins. Logins, cookies,
-and preferences are never touched.
+One shared Claude Code session list for every Claude Desktop account and
+org on this PC, plus customization sync (MCP servers, preferences,
+Desktop Extensions) across claude-deck profiles.
+
+Sessions work structurally since v4 (Windows): a one-time restructure
+(needs Claude fully closed) moves the union of every <account>\<org>
+index into claude-code-sessions\_shared and replaces the org folders
+with directory junctions to it. After that there is one physical list:
+new sessions appear under every account instantly, a delete in the app
+is a delete everywhere, nothing is copied on a schedule. Every run also
+self-heals: a session whose transcript exists but whose list entry was
+never written (app restart, rewound session) gets a minimal entry
+generated from the transcript. Existing entries are never edited;
+transcripts are never touched; deletes are never resurrected (tracked
+in heal-ledger.tsv). The restructure backs up the whole tree first and
+-Revert restores it completely (also only with Claude closed).
 
 Usage: claude-sync [command]   (--gnu-style spellings work too)
 
-  (no command)     Run the sync (deletions propagate; see -NoDeletes).
-  -DryRun          Show what a sync would do, write nothing.
-  -NoDeletes       Sync WITHOUT propagating deletions. Anything deleted on
-                   one side but alive elsewhere is copied back instead:
-                   use this to restore a session or MCP server you
-                   deleted by mistake (before the deletion has synced).
-  -Revert          Undo the most recent sync run from its backup.
-  -Status          Show detected accounts, session counts, install state.
+  (no command)     Run the sync. With Claude closed: restructure (first
+                   run), then self-heal. With Claude open: self-heal only;
+                   the restructure waits and says so.
+  -DryRun          Show everything a run would do, write nothing.
+  -NoDeletes       MCP servers only: skip removal propagation (and thereby
+                   restore a server deleted on one side). Sessions no
+                   longer need it: one physical list has no copies to
+                   reconcile.
+  -Revert          Undo the most recent run from its backup. A run that
+                   restructured the tree restores it fully (Claude must
+                   be closed for that).
+  -Status          Show tree state, entry counts, install state.
   -Install         Copy this script to ~\.claude\scripts\ and register the
                    'claude-sync' command in your PowerShell profile.
                    Re-run to update.
@@ -1162,13 +1673,9 @@ Usage: claude-sync [command]   (--gnu-style spellings work too)
   -Version         Print version.
   -Help            This text.
 
-Before the first sync: log in to the new account in Claude Desktop, start
-one throwaway Claude Code session ('hi' is enough), quit Claude, then sync.
-
-Warning: deletion propagation removes files after a backup, but a mistake
-can still cost you a session across every account. -Revert undoes the
-last run; -DryRun previews what would be deleted; -NoDeletes restores
-a not-yet-propagated deletion from the surviving copies.
+First run: close Claude Desktop fully, run claude-sync once, reopen.
+Everything after that can run anytime (self-heal is safe with the app
+open; structural changes simply wait for a closed app).
 "@
 }
 

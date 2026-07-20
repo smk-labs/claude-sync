@@ -2,7 +2,9 @@
 
 **See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-**macOS** (`claude-sync.sh`) and **Windows** (`claude-sync.ps1`), one script per platform, no dependencies. Both implement the same v3 behavior; the Windows script works on Windows PowerShell 5.1 and PowerShell 7+ and accepts both `-DryRun`-style switches and the macOS `--dry-run` spellings.
+**macOS** (`claude-sync.sh`) and **Windows** (`claude-sync.ps1`), one script per platform, no dependencies. The Windows script works on Windows PowerShell 5.1 and PowerShell 7+ and accepts both `-DryRun`-style switches and the macOS `--dry-run` spellings.
+
+**The two platforms now use different session designs.** macOS still runs the v3 copy design (described below). Windows v4 replaced it with a structural fix: one shared physical list behind directory junctions, plus a self-heal step that rebuilds lost list entries from their transcripts. See [Windows v4](#windows-v4-one-shared-list-via-junctions).
 
 ---
 
@@ -36,7 +38,20 @@ That's it.
 
 ---
 
-## What it does
+## Windows v4: one shared list via junctions
+
+On Windows, `claude-sync` no longer copies session index files between account folders at all. Instead, one run with Claude Desktop **fully closed** restructures the tree once:
+
+- The union of every `<account>\<org>` folder's `local_*.json` moves into one real folder, `claude-code-sessions\_shared` (union conflicts resolve like v3: newest activity wins, archived-in-one wins).
+- Every `<account>\<org>` folder becomes a **directory junction** to `_shared`.
+
+After that there is one physical list. Every account and org reads and writes the same files: a new session appears everywhere instantly, a rename or archive is one file edit, and a delete in the app is already a delete everywhere. Nothing runs on a schedule to keep copies aligned, because there are no copies. (The v3 un-archive limitation disappears too: with one file per session, un-archiving in any account un-archives it everywhere.)
+
+Every run (Claude open or closed) also **self-heals**: any transcript in `~\.claude\projects` whose session has no list entry (the app sometimes never writes one after a restart or a rewound session) gets a minimal entry generated from the transcript itself: title from the recorded custom title or the first user message, cwd, timestamps and model read from the transcript. Existing entries are never edited or deleted; transcripts are never touched; an entry the user deleted in the app is never resurrected (tracked in `heal-ledger.tsv`).
+
+Safety: the restructure snapshots the whole tree first (junction-aware) and `-Revert` restores it completely; the restructure and structural reverts refuse to run while Claude Desktop is up; anything newer than a snapshot is moved aside during a revert, never deleted. If the app later creates a fresh real `<account>\<org>` folder (a new login), the next run with Claude closed absorbs and junctions it automatically.
+
+## What it does (macOS, v3)
 
 A full two-way sync, not a one-way copy:
 
@@ -48,9 +63,9 @@ A full two-way sync, not a one-way copy:
 - **Honest summary numbers.** The report counts sessions, not file copies. "3 new, 5 updated" means 3 sessions and 5 sessions, not the 36 files behind them.
 - **Fast.** One single pass over all files instead of comparing every account against every other one.
 
-### One honest limitation
+### One honest limitation (macOS v3 only)
 
-**Un-archiving does not propagate.** If a session is still archived in *any* account, the next sync archives it everywhere again. To truly unarchive a session, unarchive it in every account (or unarchive it and don't sync).
+**Un-archiving does not propagate.** If a session is still archived in *any* account, the next sync archives it everywhere again. To truly unarchive a session, unarchive it in every account (or unarchive it and don't sync). Windows v4 does not have this limitation: there is only one physical copy to edit.
 
 ---
 
@@ -67,6 +82,8 @@ Deliberately **not** synced: logins, cookies, and UI preferences: separate accou
 ---
 
 ## Syncing deletes
+
+*(Windows v4 note: session deletes need none of this machinery anymore; with one physical list, a delete in the app IS the delete everywhere, and self-heal never resurrects it. The ledger guards below still apply to MCP server removals, and to sessions on macOS.)*
 
 Since v2.3, deletes propagate by default: delete a session in any account (or remove an MCP server in any profile) and the next sync deletes it everywhere. This includes auto-sync. It's safe to have on because every deletion is backed up first and three guards watch over it:
 
@@ -99,7 +116,9 @@ You log into a second account in Claude Desktop and your Claude Code session lis
 
 ## Before your first sync (important)
 
-`claude-sync` can only see accounts that already have a session folder, and a freshly added account doesn't have one yet. So, once per new account:
+**Windows v4:** the first real run must happen with Claude Desktop fully closed (quit it, run `claude-sync`, reopen). Every run after that can happen anytime; structural work simply waits for a closed app and says so. A brand-new account/org gets its folder absorbed automatically on the next closed-app run.
+
+**macOS v3:** `claude-sync` can only see accounts that already have a session folder, and a freshly added account doesn't have one yet. So, once per new account:
 
 1. **Log in** to the new account in Claude Desktop.
 2. Open **Claude Code** and start one **throwaway session**. A plain "hi" is enough. This makes Claude create the session folder for that account, so `claude-sync` can recognize it.
@@ -142,7 +161,7 @@ On macOS this is a LaunchAgent (a small bash loop that checks every few seconds,
 
 ---
 
-## How it works
+## How it works (macOS v3; Windows v4 is described [above](#windows-v4-one-shared-list-via-junctions))
 
 1. **Inventory.** Lists every `local_*.json` session index file under every account folder in Claude's `claude-code-sessions` data dir, and reads two fields from each: last activity time and archived state.
 2. **Pick winners.** For each session, the copy with the newest activity wins. If the session is archived in any account, the winning copy is marked archived too.
