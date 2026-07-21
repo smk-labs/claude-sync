@@ -30,6 +30,22 @@
 #   - NEWCOMERS: when the app later creates a fresh real <account>\<org>
 #     folder (first login of a new account/org), the next run with Claude
 #     closed absorbs its entries into _shared and junctions it too.
+#   - ARCHIVE REPLAY (every run, safe with Claude open): current MSIX
+#     builds of Claude Desktop log every archive/unarchive to their
+#     main.log but fail to persist the isArchived flag into the session
+#     index, so the whole cleanup silently reverts on the next launch
+#     (verified 2026-07-21: the archive action produces log lines and
+#     zero index writes; the app also re-asserts stale entries from
+#     memory within seconds if a loaded entry changes under it). Every
+#     run therefore tails each profile's main.log (offsets kept in
+#     archive-log-offsets.tsv), turns "Archived/Unarchived session
+#     local_*" lines into intents (archive-intents.tsv, newest event per
+#     id wins), and applies any intent the index disagrees with. Applied
+#     -and-stable intents are dropped; intents whose entry is gone are
+#     dropped (deletes are never resurrected); intents expire after 14
+#     days. Flag writes are backed up into the run manifest, so -Revert
+#     undoes them too. The watcher also tails the logs, so an archive
+#     lands in the index seconds after you click it, restart-proof.
 # The v3 copy machinery (winner distribution, deletion ledger) is gone for
 # sessions: with one physical list there is nothing to reconcile and a
 # delete in the app is already a delete everywhere. ledger.tsv is read one
@@ -110,19 +126,37 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '4.0.0'
+$ScriptVersion = '4.1.0'
 
 # $env:APPDATA fallback keeps the script parseable on non-Windows for testing.
 $AppData = if ($env:APPDATA) { $env:APPDATA } else { Join-Path $HOME 'AppData\Roaming' }
 
+# MSIX write-virtualization escape (2026-07-21): the packaged app's
+# AppData writes land in %LOCALAPPDATA%\Packages\Claude_...\LocalCache,
+# not the real Roaming, so the app and this script were editing two
+# different copies of every file. Once the migrated ~\ClaudeProfiles root
+# exists, all data dirs live there (default included, as
+# ~\ClaudeProfiles\default, whose claude-code-sessions dir is the
+# physical shared root) and both sides see the same files again.
+$EscapedRoot    = Join-Path $HOME 'ClaudeProfiles'
+$UseEscapedRoot = Test-Path -LiteralPath $EscapedRoot
+
 # CLAUDE_SYNC_* overrides exist so tests can point the script at a
 # throwaway tree instead of the real one (same names as the macOS script).
 $SessionsDir = if ($env:CLAUDE_SYNC_SESSIONS_DIR) { $env:CLAUDE_SYNC_SESSIONS_DIR }
+               elseif ($UseEscapedRoot) { Join-Path $EscapedRoot 'default\claude-code-sessions' }
                else { Join-Path $AppData 'Claude\claude-code-sessions' }
 $DefaultRoot = if ($env:CLAUDE_SYNC_DEFAULT_ROOT) { $env:CLAUDE_SYNC_DEFAULT_ROOT }
+               elseif ($UseEscapedRoot) { Join-Path $EscapedRoot 'default' }
                else { Join-Path $AppData 'Claude' }
 $ProfilesDir = if ($env:CLAUDE_SYNC_PROFILES_DIR) { $env:CLAUDE_SYNC_PROFILES_DIR }
+               elseif ($UseEscapedRoot) { $EscapedRoot }
                else { Join-Path $AppData 'Claude Profiles' }
+# The real (non-test-override) sessions dir, for is-this-the-real-tree
+# guards. Under the escaped root the default dir sits INSIDE $ProfilesDir,
+# so profile enumerations skip it by full path (see Get-DataRoots).
+$RealSessionsDir = if ($UseEscapedRoot) { Join-Path $EscapedRoot 'default\claude-code-sessions' }
+                   else { Join-Path $AppData 'Claude\claude-code-sessions' }
 $ProjectsDir = if ($env:CLAUDE_SYNC_PROJECTS_DIR) { $env:CLAUDE_SYNC_PROJECTS_DIR }
                else { Join-Path $HOME '.claude\projects' }
 $CanonicalDir = if ($env:CLAUDE_SYNC_HOME) { $env:CLAUDE_SYNC_HOME }
@@ -135,6 +169,8 @@ $LedgerPath         = Join-Path $CanonicalDir 'ledger.tsv'
 $LedgerAccountsPath = Join-Path $CanonicalDir '.ledger-accounts.tsv'
 $McpLedgerPath      = Join-Path $CanonicalDir 'mcp-ledger.tsv'
 $HealLedgerPath     = Join-Path $CanonicalDir 'heal-ledger.tsv'
+$ArchiveIntentsPath = Join-Path $CanonicalDir 'archive-intents.tsv'
+$ArchiveOffsetsPath = Join-Path $CanonicalDir 'archive-log-offsets.tsv'
 $RcBegin            = '# >>> claude-sync shortcut >>>'
 $RcEnd              = '# <<< claude-sync shortcut <<<'
 $TaskName           = 'claude-sync-watcher'
@@ -151,7 +187,12 @@ function Write-Log {
     New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
     $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Write-Host $line
-    Add-Content -Path $LogPath -Value $line
+    # Add-Content opens the log FileShare-Read, so two writers (watcher +
+    # manual run) contend; a locked log must never hang or kill a sync.
+    for ($try = 0; $try -lt 3; $try++) {
+        try { Add-Content -Path $LogPath -Value $line -ErrorAction Stop; return }
+        catch { Start-Sleep -Milliseconds (50 * ($try + 1)) }
+    }
 }
 
 # Dry runs print to the console only; nothing on disk changes, log included.
@@ -204,8 +245,14 @@ function Get-LongDirPath {
 
 # Canonicalize once: a short-form %APPDATA%/%TEMP% from the environment
 # would otherwise make every junction-target comparison fail.
-$SessionsDir = Get-LongDirPath -Path $SessionsDir
-$SharedDir   = Join-Path $SessionsDir '_shared'
+$SessionsDir     = Get-LongDirPath -Path $SessionsDir
+$SharedDir       = Join-Path $SessionsDir '_shared'
+# DefaultRoot/ProfilesDir feed full-path comparisons too (the escaped root
+# puts default INSIDE ProfilesDir, skipped by -ieq against enumerated
+# long-form paths), so they need the same canonicalization.
+$DefaultRoot     = Get-LongDirPath -Path $DefaultRoot
+$ProfilesDir     = Get-LongDirPath -Path $ProfilesDir
+$RealSessionsDir = Get-LongDirPath -Path $RealSessionsDir
 
 # ---------- profile customization sync ------------------------------------
 function Get-DataRoots {
@@ -216,6 +263,7 @@ function Get-DataRoots {
     $roots.Add($DefaultRoot)
     if (Test-Path -LiteralPath $ProfilesDir) {
         foreach ($d in @(Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.FullName -ieq $DefaultRoot) { continue }  # escaped root: default lives inside ProfilesDir
             $roots.Add($d.FullName)
         }
     }
@@ -575,7 +623,7 @@ function Test-ClaudeDesktopRunning {
     # tests exercise the postpone paths; it can only make the tool MORE
     # conservative, never less.
     if ($env:CLAUDE_SYNC_TEST_FORCE_RUNNING) { return $true }
-    $realSessions = Get-LongDirPath -Path (Join-Path (Join-Path $AppData 'Claude') 'claude-code-sessions')
+    $realSessions = Get-LongDirPath -Path $RealSessionsDir
     if ($env:CLAUDE_SYNC_SESSIONS_DIR -and ($SessionsDir -ine $realSessions)) { return $false }
     $paths = New-Object System.Collections.Generic.List[string]
     try {
@@ -776,10 +824,13 @@ function Read-EntryMeta {
     # case-colliding keys that ConvertFrom-Json rejects.
     param([string]$Path)
     $raw = [System.IO.File]::ReadAllText($Path)
+    # Both serializations exist on disk: the compact form most entries carry
+    # and the pretty-printed one ("isArchived": false) the app writes when it
+    # re-persists an entry. Every isArchived read/write must tolerate both.
     $ts = [long]0
-    if ($raw -match '"lastActivityAt":(\d+)') { $ts = [long]$Matches[1] }
+    if ($raw -match '"lastActivityAt"\s*:\s*(\d+)') { $ts = [long]$Matches[1] }
     $arch = $false
-    if ($raw -match '"isArchived":(true|false)') { $arch = ($Matches[1] -eq 'true') }
+    if ($raw -match '"isArchived"\s*:\s*(true|false)') { $arch = ($Matches[1] -eq 'true') }
     return @{ Ts = $ts; Arch = $arch }
 }
 
@@ -927,7 +978,7 @@ function Invoke-SessionUnify {
             $dst = Join-Path $SharedDir $mv.Fname
             if ($mv.Flip) {
                 $raw = [System.IO.File]::ReadAllText($mv.SrcPath)
-                [System.IO.File]::WriteAllText($dst, $raw.Replace('"isArchived":false', '"isArchived":true'))
+                [System.IO.File]::WriteAllText($dst, [regex]::Replace($raw, '("isArchived"\s*:\s*)false', '${1}true'))
                 (Get-Item -LiteralPath $dst).LastWriteTimeUtc = (Get-Item -LiteralPath $mv.SrcPath).LastWriteTimeUtc
             } else {
                 [System.IO.File]::Copy($mv.SrcPath, $dst, $true)
@@ -1165,7 +1216,21 @@ function Invoke-SessionHeal {
         $listed = $ListedOverride
     } else {
         foreach ($f in @(Get-ChildItem -LiteralPath $SharedDir -File -Force -ErrorAction SilentlyContinue)) {
-            if ($f.Name -match $script:LocalNameRe) { $listed[$Matches[1].ToLowerInvariant()] = $true }
+            if ($f.Name -notmatch $script:LocalNameRe) { continue }
+            $listed[$Matches[1].ToLowerInvariant()] = $true
+            # An app-created entry is named after the app's OWN session id and
+            # carries the transcript id inside as cliSessionId; only the
+            # heal-generated shape has the two equal. Keying on the filename
+            # alone therefore made every app-created session look unlisted and
+            # got it healed a second time (53 duplicate pairs on this machine
+            # before the key was widened). Regex, never ConvertFrom-Json: a few
+            # real entries carry case-colliding enabledMcpTools keys.
+            try {
+                $txt = [System.IO.File]::ReadAllText($f.FullName)
+                if ($txt -match '"cliSessionId"\s*:\s*"([0-9a-fA-F-]{36})"') {
+                    $listed[$Matches[1].ToLowerInvariant()] = $true
+                }
+            } catch { }
         }
     }
     if (-not (Test-Path -LiteralPath $ProjectsDir)) {
@@ -1259,6 +1324,198 @@ function Invoke-SessionHeal {
     }
 }
 
+# ---------- archive replay: app log -> index flags --------------------------
+# Current MSIX builds log every archive/unarchive but never write the flag
+# into the index, and rewrite loaded entries from stale memory when the file
+# changes under them. The app's own log is therefore the only durable record
+# of what the user archived; these functions replay it onto _shared.
+
+function Get-AppLogPaths {
+    # Every main.log the app can write: the default data dir plus one per
+    # named profile. Missing files are skipped by the reader.
+    $paths = New-Object System.Collections.Generic.List[string]
+    $paths.Add((Join-Path $DefaultRoot 'logs\main.log'))
+    if (Test-Path -LiteralPath $ProfilesDir) {
+        foreach ($d in @(Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.FullName -ieq $DefaultRoot) { continue }  # escaped root: default lives inside ProfilesDir
+            $paths.Add((Join-Path $d.FullName 'Logs\main.log'))
+        }
+    }
+    return $paths
+}
+
+# One archive/unarchive event per log line; the app writes each line twice
+# and both spellings ("LocalSessions.archive: sessionId=..." then "Archived
+# session ..."), so consumers dedupe by newest-timestamp-per-id.
+$script:ArchiveLineRe = '^(?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[info\] (?:LocalSessions\.(?<v1>archive|unarchive): sessionId=|(?<v2>Archived|Unarchived) session )(?<id>local_[0-9a-fA-F-]{36})\s*$'
+
+function Read-AppLogTail {
+    # Appended bytes of one log since $Offset, read shared so a live app is
+    # never blocked. Returns the text and the new offset; offset resets to 0
+    # when the file shrank (rotation).
+    param([string]$Path, [long]$Offset)
+    $r = @{ Text = ''; Offset = $Offset }
+    if (-not (Test-Path -LiteralPath $Path)) { return $r }
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            if ($fs.Length -lt $Offset) { $Offset = 0 }
+            $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+            $sr = New-Object System.IO.StreamReader($fs)
+            $r.Text = $sr.ReadToEnd()
+            $r.Offset = $fs.Length
+        } finally { $fs.Close() }
+    } catch { }
+    return $r
+}
+
+function Get-ArchiveOffsets {
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $ArchiveOffsetsPath)) { return $map }
+    foreach ($line in @(Get-Content -LiteralPath $ArchiveOffsetsPath -ErrorAction SilentlyContinue)) {
+        $parts = $line -split "`t"
+        if ($parts.Count -eq 2 -and $parts[1] -match '^\d+$') { $map[$parts[0]] = [long]$parts[1] }
+    }
+    return $map
+}
+
+function Get-ArchiveIntents {
+    # id -> @{ State = '0'|'1'; Ts = 'yyyy-MM-dd HH:mm:ss' }
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $ArchiveIntentsPath)) { return $map }
+    foreach ($line in @(Get-Content -LiteralPath $ArchiveIntentsPath -ErrorAction SilentlyContinue)) {
+        $parts = $line -split "`t"
+        if ($parts.Count -eq 3 -and $parts[1] -match '^[01]$') {
+            $map[$parts[0]] = @{ State = $parts[1]; Ts = $parts[2] }
+        }
+    }
+    return $map
+}
+
+function Save-ArchiveState {
+    # Both ledgers, atomic (temp + move), written only when content changed.
+    param($Intents, $Offsets)
+    New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
+    $iLines = @($Intents.Keys | Sort-Object | ForEach-Object {
+        "{0}`t{1}`t{2}" -f $_, $Intents[$_].State, $Intents[$_].Ts })
+    $iNew = ''
+    if ($iLines.Count -gt 0) { $iNew = (($iLines -join "`n") + "`n") }
+    $iOld = ''
+    if (Test-Path -LiteralPath $ArchiveIntentsPath) { $iOld = [System.IO.File]::ReadAllText($ArchiveIntentsPath) }
+    if ($iNew -ne $iOld) {
+        $tmp = "$ArchiveIntentsPath.tmp.$PID"
+        [System.IO.File]::WriteAllText($tmp, $iNew)
+        Move-Item -LiteralPath $tmp -Destination $ArchiveIntentsPath -Force
+    }
+    $oLines = @($Offsets.Keys | Sort-Object | ForEach-Object { "{0}`t{1}" -f $_, $Offsets[$_] })
+    $oNew = ''
+    if ($oLines.Count -gt 0) { $oNew = (($oLines -join "`n") + "`n") }
+    $oOld = ''
+    if (Test-Path -LiteralPath $ArchiveOffsetsPath) { $oOld = [System.IO.File]::ReadAllText($ArchiveOffsetsPath) }
+    if ($oNew -ne $oOld) {
+        $tmp = "$ArchiveOffsetsPath.tmp.$PID"
+        [System.IO.File]::WriteAllText($tmp, $oNew)
+        Move-Item -LiteralPath $tmp -Destination $ArchiveOffsetsPath -Force
+    }
+}
+
+function Invoke-ArchiveReplay {
+    # Tail every app log for archive/unarchive events, fold them into the
+    # intent ledger (newest event per id wins), and make _shared agree with
+    # every live intent. Safe with the app open: worst case a loaded entry
+    # gets re-asserted stale by the app and the next run reapplies; state
+    # converges the moment the app quits. Dry runs preview and consume
+    # nothing.
+    Set-StrictMode -Version 2
+    if (-not (Test-Path -LiteralPath $SharedDir)) { return }
+    $offsets = Get-ArchiveOffsets
+    $intents = Get-ArchiveIntents
+    $firstRun = -not (Test-Path -LiteralPath $ArchiveOffsetsPath)
+    # First run has no offsets and would replay the app's whole log history;
+    # bound it to the recent past so long-settled states are not disturbed.
+    $historyFloor = (Get-Date).AddHours(-48).ToString('yyyy-MM-dd HH:mm:ss')
+
+    $newOffsets = @{}
+    $events = 0
+    foreach ($logPath in Get-AppLogPaths) {
+        $off = [long]0
+        if ($offsets.ContainsKey($logPath)) { $off = $offsets[$logPath] }
+        $tail = Read-AppLogTail -Path $logPath -Offset $off
+        $newOffsets[$logPath] = $tail.Offset
+        if (-not $tail.Text) { continue }
+        foreach ($line in ($tail.Text -split "`r?`n")) {
+            $m = [regex]::Match($line, $script:ArchiveLineRe)
+            if (-not $m.Success) { continue }
+            $ts = $m.Groups['ts'].Value
+            if ($firstRun -and ($ts -lt $historyFloor)) { continue }
+            $verb = $m.Groups['v1'].Value
+            if (-not $verb) { $verb = $m.Groups['v2'].Value }
+            $state = '1'
+            if ($verb -match '^[Uu]narchive') { $state = '0' }
+            $id = $m.Groups['id'].Value.ToLowerInvariant()
+            # Timestamps in this format sort lexically; newest event wins.
+            if ($intents.ContainsKey($id) -and ($intents[$id].Ts -gt $ts)) { continue }
+            $intents[$id] = @{ State = $state; Ts = $ts }
+            $events++
+        }
+    }
+
+    # Apply: every intent the index disagrees with gets its flag written.
+    # Drop an intent once it is applied and stable, once its entry is gone
+    # (a delete in the app must never be resurrected), or after 14 days.
+    $ttlFloor = (Get-Date).AddDays(-14).ToString('yyyy-MM-dd HH:mm:ss')
+    $applied = 0; $pending = 0
+    foreach ($id in @($intents.Keys)) {
+        $it = $intents[$id]
+        if ($it.Ts -lt $ttlFloor) { $intents.Remove($id); continue }
+        $entry = Join-Path $SharedDir "$id.json"
+        if (-not (Test-Path -LiteralPath $entry)) { $intents.Remove($id); continue }
+        # A read/write race with the live app keeps the intent for next run.
+        try { $raw = [System.IO.File]::ReadAllText($entry) } catch { $pending++; continue }
+        if ($raw -notmatch '"isArchived"\s*:\s*(true|false)') { $intents.Remove($id); continue }
+        $current = '0'
+        if ($Matches[1] -eq 'true') { $current = '1' }
+        if ($current -eq $it.State) { $intents.Remove($id); continue }
+        if ($DryRun) {
+            $word = 'archive'
+            if ($it.State -eq '0') { $word = 'unarchive' }
+            Write-Host ('  would {0} (from app log {1}): {2}.json' -f $word, $it.Ts, $id)
+            $pending++
+            continue
+        }
+        Initialize-RunDir
+        $bakDir = Join-Path $script:RunDir 'archive-flags'
+        New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+        $bak = Join-Path $bakDir "$id.json"
+        if (-not (Test-Path -LiteralPath $bak)) {
+            [System.IO.File]::WriteAllText($bak, $raw)
+            Add-ManifestRow ("overwrote`t{0}`t{1}" -f $entry, $bak)
+        }
+        if ($it.State -eq '1') {
+            $raw = [regex]::Replace($raw, '("isArchived"\s*:\s*)false', '${1}true')
+        } else {
+            $raw = [regex]::Replace($raw, '("isArchived"\s*:\s*)true', '${1}false')
+        }
+        try { [System.IO.File]::WriteAllText($entry, $raw) } catch { $pending++; continue }
+        Write-Log ('  archive replay: set isArchived={0} on {1}.json (app log event {2})' -f ($it.State -eq '1').ToString().ToLower(), $id, $it.Ts)
+        $applied++
+        $pending++   # stays in the ledger until observed stable next run
+    }
+
+    if ($DryRun) {
+        if (($events -gt 0) -or ($pending -gt 0)) {
+            Write-Host ('Archive replay: {0} new log event(s); {1} flag(s) would be applied. Nothing written.' -f $events, $pending)
+        }
+        return
+    }
+    Save-ArchiveState -Intents $intents -Offsets $newOffsets
+    if ($applied -gt 0) {
+        Write-Log ('Archive replay: applied {0} flag(s) from app logs ({1} intent(s) pending confirmation).' -f $applied, $pending)
+    }
+}
+
 function Invoke-SessionModule {
     # Session work for one run: restructure when needed and possible
     # (Claude fully closed), then self-heal. The restructure is never
@@ -1302,6 +1559,7 @@ function Invoke-SessionModule {
     }
     if ($state.SharedExists) {
         Invoke-SessionHeal
+        Invoke-ArchiveReplay
         $n = @(Get-ChildItem -LiteralPath $SharedDir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
         Out-Sync ('Sessions: one unified index, {0} entries in _shared, visible to every account and org.' -f $n)
     } else {
@@ -1447,7 +1705,37 @@ function Invoke-Watch {
     Register-ObjectEvent $fsw Created -SourceIdentifier 'claude-sync-fs-created' | Out-Null
     Register-ObjectEvent $fsw Changed -SourceIdentifier 'claude-sync-fs-changed' | Out-Null
     $fsw.EnableRaisingEvents = $true
-    Write-Log '[watcher] Watcher started (transcript events).'
+
+    # App logs too: an archive click writes a log line and nothing else (no
+    # transcript event), so without this an archive-then-quit-then-relaunch
+    # still loses. main.log is chatty (memory stats every few seconds), so a
+    # log event only counts as activity when the appended lines actually
+    # contain archive/unarchive verbs; offsets here are in-memory only and
+    # seed at the current file length (history belongs to Invoke-ArchiveReplay).
+    $logWatchers = New-Object System.Collections.Generic.List[object]
+    $logDirs = New-Object System.Collections.Generic.List[string]
+    # Escaped root: the default dir sits inside ProfilesDir, whose recursive
+    # watcher below already covers it; a second watcher would double-fire.
+    if (-not ($ProfilesDir -and $DefaultRoot.StartsWith($ProfilesDir, [StringComparison]::OrdinalIgnoreCase))) {
+        $logDirs.Add((Join-Path $DefaultRoot 'logs'))
+    }
+    if (Test-Path -LiteralPath $ProfilesDir) { $logDirs.Add($ProfilesDir) }
+    $i = 0
+    foreach ($dir in $logDirs) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $lw = New-Object System.IO.FileSystemWatcher $dir, 'main.log'
+        $lw.IncludeSubdirectories = ($dir -eq $ProfilesDir)
+        Register-ObjectEvent $lw Changed -SourceIdentifier ("claude-sync-applog-$i") | Out-Null
+        $lw.EnableRaisingEvents = $true
+        $logWatchers.Add($lw)
+        $i++
+    }
+    $logOffsets = @{}
+    foreach ($logPath in Get-AppLogPaths) {
+        if (Test-Path -LiteralPath $logPath) { $logOffsets[$logPath] = (Get-Item -LiteralPath $logPath).Length }
+    }
+
+    Write-Log '[watcher] Watcher started (transcript + app-log events).'
     $lastRun = Get-Date
     $lastEventAt = $null
     while ($true) {
@@ -1455,9 +1743,28 @@ function Invoke-Watch {
         # times out quietly otherwise.
         $ev = Wait-Event -Timeout 3 -ErrorAction SilentlyContinue
         if ($ev) {
-            $lastEventAt = Get-Date
-            Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue
-            Get-Event -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue
+            # Process the whole queue: every event is either transcript
+            # activity (counts as-is) or an app-log append (counts only when
+            # the new lines carry archive/unarchive verbs).
+            $queue = @($ev) + @(Get-Event -ErrorAction SilentlyContinue)
+            foreach ($e in $queue) {
+                if ($e.SourceIdentifier -like 'claude-sync-applog-*') {
+                    $evPath = $null
+                    try { $evPath = $e.SourceEventArgs.FullPath } catch { }
+                    if ($evPath) {
+                        $off = [long]0
+                        if ($logOffsets.ContainsKey($evPath)) { $off = $logOffsets[$evPath] }
+                        $tail = Read-AppLogTail -Path $evPath -Offset $off
+                        $logOffsets[$evPath] = $tail.Offset
+                        if ($tail.Text -and ($tail.Text -match 'LocalSessions\.(archive|unarchive)|(Archived|Unarchived) session local_')) {
+                            $lastEventAt = Get-Date
+                        }
+                    }
+                } else {
+                    $lastEventAt = Get-Date
+                }
+                Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+            }
             continue
         }
         if (-not $lastEventAt) { continue }
