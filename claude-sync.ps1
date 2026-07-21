@@ -1431,24 +1431,46 @@ function Invoke-Revert {
 
 # ---------- watcher (hands-off mode) ---------------------------------------
 function Invoke-Watch {
-    Write-Log '[watcher] Watcher started.'
+    # Purely event-driven: a FileSystemWatcher on the transcripts dir wakes
+    # the loop the moment any *.jsonl is created or appended (a conversation
+    # exists the instant its transcript does, before the reply even lands).
+    # Trailing debounce: sync fires after QUIET seconds of write silence, at
+    # most once per MININT seconds. Quit needs no trigger of its own: a
+    # quitting app's final writes are themselves events. Self-heal is
+    # additive and safe with instances open; the restructure part
+    # self-postpones while any instance runs.
+    $QUIET = 8; $MININT = 45
+    New-Item -ItemType Directory -Force -Path $ProjectsDir | Out-Null
+    $fsw = New-Object System.IO.FileSystemWatcher $ProjectsDir, '*.jsonl'
+    $fsw.IncludeSubdirectories = $true
+    $fsw.InternalBufferSize = 65536
+    Register-ObjectEvent $fsw Created -SourceIdentifier 'claude-sync-fs-created' | Out-Null
+    Register-ObjectEvent $fsw Changed -SourceIdentifier 'claude-sync-fs-changed' | Out-Null
+    $fsw.EnableRaisingEvents = $true
+    Write-Log '[watcher] Watcher started (transcript events).'
+    $lastRun = Get-Date
+    $lastEventAt = $null
     while ($true) {
-        # Wait for Claude Desktop (by install path, so the Claude Code CLI,
-        # which is also a claude.exe, never counts).
-        while (-not (Test-ClaudeDesktopRunning)) {
-            Start-Sleep -Seconds 5
+        # Wait-Event doubles as the sleep: returns on the first event,
+        # times out quietly otherwise.
+        $ev = Wait-Event -Timeout 3 -ErrorAction SilentlyContinue
+        if ($ev) {
+            $lastEventAt = Get-Date
+            Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue
+            Get-Event -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue
+            continue
         }
-        Write-Log '[watcher] Claude Desktop detected. Waiting for quit...'
-        while (Test-ClaudeDesktopRunning) {
-            Start-Sleep -Seconds 2
-        }
-        # Brief grace period for helpers to clean up.
-        Start-Sleep -Seconds 3
-        Write-Log '[watcher] Claude quit. Running sync...'
+        if (-not $lastEventAt) { continue }
+        $now = Get-Date
+        if ((($now - $lastEventAt).TotalSeconds) -lt $QUIET) { continue }
+        if ((($now - $lastRun).TotalSeconds) -lt $MININT) { continue }
+        Write-Log '[watcher] Transcript activity: running sync...'
         # Fresh run state per iteration (one backup run dir per sync).
         $script:RunDir = $null
         $script:ManifestPath = $null
-        Invoke-Sync | Out-Null
+        try { Invoke-Sync | Out-Null } catch { Write-Log ('[watcher] sync failed: {0}' -f $_.Exception.Message) }
+        $lastRun = Get-Date
+        $lastEventAt = $null
     }
 }
 
