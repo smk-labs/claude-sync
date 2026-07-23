@@ -301,6 +301,10 @@ function Sync-McpServers {
     #   - definitions differ -> the one from the newest-mtime config wins
     #     and overwrites the rest (tie: the default root, listed first, wins),
     #   - name missing from a config -> added there.
+    #   - a config with NO servers at all never votes for removal: that is a
+    #     fresh or app-reset profile, not a deliberate mass-delete. On
+    #     2026-07-23 a blank profile dir launched once made the watcher
+    #     remove every server from all ten profiles.
     # The plan is computed once in memory and then applied, so narration and
     # writes can never disagree on the decision logic.
     param($Roots, [bool]$Deletes)
@@ -331,10 +335,13 @@ function Sync-McpServers {
     $chosen   = @{}
     $chosenMt = @{}
     $pcount   = @{}
+    $voters = 0
     foreach ($cfg in $cfgs) {
         $mProp = $cfg.Json.PSObject.Properties['mcpServers']
         if (-not $mProp -or $null -eq $mProp.Value) { continue }
-        foreach ($prop in @($mProp.Value.PSObject.Properties)) {
+        $props = @($mProp.Value.PSObject.Properties)
+        if ($props.Count -gt 0) { $voters++ }
+        foreach ($prop in $props) {
             $k = $prop.Name
             if ($pcount.ContainsKey($k)) { $pcount[$k]++ } else { $pcount[$k] = 1 }
             if (-not $chosen.ContainsKey($k)) {
@@ -349,7 +356,7 @@ function Sync-McpServers {
     $removed = @{}
     if ($Deletes) {
         foreach ($k in $order) {
-            if ($ledger.ContainsKey($k) -and $pcount[$k] -lt $cfgs.Count) { $removed[$k] = 1 }
+            if ($ledger.ContainsKey($k) -and $pcount[$k] -lt $voters) { $removed[$k] = 1 }
         }
     }
 
